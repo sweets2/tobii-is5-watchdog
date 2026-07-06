@@ -12,6 +12,14 @@
     "streaming but frozen/invalid" stall -- use the tray's "Reconnect now" button
     for that.
 
+    STACK-PRESENCE CHECK: the log state alone can be a lie. After a crash or a
+    cold boot (e.g. battery died in sleep) the last ServerLog line still says
+    'Tracking' from the PREVIOUS session while 'Tobii Service' is stopped and no
+    engine process exists. So the state is only trusted while the engine process
+    is alive; if the middleware service or engine is missing past the threshold
+    (and past a post-boot grace, since 'Tobii Service' is Automatic-Delayed and
+    legitimately takes ~2-4 min to start after boot), that is a fault too.
+
     Recovery escalation (auto): 1 = restart runtime service; 2+ = kill+respawn
     EyeX engine, restart runtime + service. (No USB power-cycle in auto -- that
     once left the device DISABLED; it's manual-only via -ForceReconnect.)
@@ -24,6 +32,7 @@ param(
     [int]$StuckThresholdSec = 30,
     [int]$PollSec          = 5,
     [int]$GraceSec         = 45,
+    [int]$BootGraceSec     = 240,
     [string]$LogPath       = 'C:\Scripts\Tobii-Watchdog.log',
     [int]$MaxLogBytes      = 1048576,
     [string]$PauseFlag     = 'C:\Scripts\watchdog.pause',
@@ -44,6 +53,31 @@ $HealthyStates = @('Tracking','Idle')   # (kept for -Once display only)
 # Never recover while the Tobii calibration/config UI is open (setup in progress).
 function Test-ConfigActive {
     [bool](Get-Process -Name 'Tobii.Configuration' -ErrorAction SilentlyContinue)
+}
+
+# Passive stack-presence check (Get-Service/Get-Process only -- never the gaze
+# stream). Returns a reason string when the middleware service or the engine
+# process is missing, else $null. While the engine is missing, the log state is
+# stale and must not be trusted.
+function Get-StackDownReason {
+    $svc = Get-Service -Name 'Tobii Service' -ErrorAction SilentlyContinue
+    if ($svc -and $svc.Status -ne 'Running') {
+        return "'Tobii Service' is $($svc.Status)"
+    }
+    if (-not (Get-Process -Name 'Tobii.EyeX.Engine' -ErrorAction SilentlyContinue)) {
+        return 'Tobii.EyeX.Engine process not running'
+    }
+    return $null
+}
+
+# Boot time, fixed for the life of this process (the watchdog starts at logon).
+# Used for the post-boot grace: 'Tobii Service' is Automatic (Delayed Start), so
+# the stack is legitimately absent for the first minutes after a boot.
+$BootTime = $null
+try { $BootTime = (Get-CimInstance Win32_OperatingSystem -ErrorAction Stop).LastBootUpTime } catch { }
+if (-not $BootTime) { $BootTime = (Get-Date).AddDays(-1) }  # unknown -> assume old boot, checks stay active
+function Test-InBootGrace {
+    ((Get-Date) - $BootTime).TotalSeconds -lt $BootGraceSec
 }
 
 # ---- logging ---------------------------------------------------------------
@@ -157,8 +191,10 @@ function Invoke-FullReconnect {
 # ---- one-shot modes --------------------------------------------------------
 if ($Once) {
     $s = Get-TrackerState
+    $down = Get-StackDownReason
+    Write-Log ("Stack=$(if($down){'DOWN: '+$down}else{'up'})  bootGrace=$(Test-InBootGrace)")
     if (-not $s) { Write-Log "Could not read tracker state." 'WARN'; exit 1 }
-    Write-Log ("State=$s  healthy=$([bool]($HealthyStates -contains $s))")
+    Write-Log ("State=$s  healthy=$([bool]($HealthyStates -contains $s))  trusted=$(-not $down)")
     exit 0
 }
 if ($ForceReconnect) {
@@ -171,7 +207,12 @@ if ($OnWake) {
     Write-Log 'Resume from sleep; checking state.'
     Start-Sleep -Seconds 6
     $s = Get-TrackerState
-    if (($FaultStates -contains $s) -and -not (Test-ConfigActive)) {
+    $down = Get-StackDownReason
+    if (Test-ConfigActive) {
+        Write-Log 'Resume: calibration/config UI active; no action.'
+    } elseif ($down -and -not (Test-InBootGrace)) {
+        Write-Log ("Resume: stack down ($down); reconnecting.") 'WARN'; Invoke-Recovery -Level 2
+    } elseif (-not $down -and ($FaultStates -contains $s)) {
         Write-Log ("Resume: state '$s'; reconnecting.") 'WARN'; Invoke-Recovery -Level 2
     } else { Write-Log "Resume: state '$(if($s){$s}else{'unknown'})'; no action." }
     exit 0
@@ -184,7 +225,7 @@ if (-not $createdNew) { Write-Log 'Another watchdog instance is already running;
 
 # ---- main loop -------------------------------------------------------------
 Rotate-Log
-Write-Log "Tobii watchdog (log-state) started. threshold=${StuckThresholdSec}s poll=${PollSec}s grace=${GraceSec}s log=$LogPath"
+Write-Log "Tobii watchdog (log-state + stack-presence) started. threshold=${StuckThresholdSec}s poll=${PollSec}s grace=${GraceSec}s bootgrace=${BootGraceSec}s log=$LogPath"
 $level = 0; $unhealthySince = $null; $iter = 0; $paused = $false
 while ($true) {
     try {
@@ -197,10 +238,26 @@ while ($true) {
         } elseif ($paused) { Write-Log "Resumed (tray)."; $paused = $false }
 
         $s = Get-TrackerState
-        # Only WaitingForDevice is a fault. Anything else (incl. null, Configuring,
-        # and all transient states) is left alone -> reset timers and wait.
-        if ($FaultStates -notcontains $s) {
-            if ($level -gt 0) { Write-Log "Recovered: state is now '$s'." }
+        $stackDown = Get-StackDownReason
+
+        # Two fault classes:
+        #  1) Stack down (service stopped / engine gone). The log state is stale
+        #     here -- after a crash or cold boot it still says 'Tracking' from the
+        #     previous session -- so it is ignored. Post-boot grace applies
+        #     because 'Tobii Service' is delayed-start.
+        #  2) Engine alive and reporting WaitingForDevice (the PRP-drop
+        #     signature). Only this state is a fault; Tracking, Idle, null and
+        #     all transient/setup states (incl. Configuring = calibration) are
+        #     left alone.
+        $fault = $null
+        if ($stackDown) {
+            if (-not (Test-InBootGrace)) { $fault = $stackDown }
+        } elseif ($FaultStates -contains $s) {
+            $fault = "state '$s'"
+        }
+
+        if (-not $fault) {
+            if ($level -gt 0) { Write-Log "Recovered: state is now '$(if($s){$s}else{'unknown'})'." }
             $level = 0; $unhealthySince = $null
             Start-Sleep -Seconds $PollSec
             continue
@@ -220,8 +277,10 @@ while ($true) {
         }
 
         $level++
-        Write-Log ("Tracker stuck in '$s' -> recovery level $level.") 'WARN'
-        Invoke-Recovery -Level $level
+        Write-Log ("Tracker fault ($fault) -> recovery level $level.") 'WARN'
+        # A stack-down fault needs the middleware service (re)started, which only
+        # happens at level 2 of the ladder -- level 1 (runtime restart) can't help.
+        if ($stackDown) { Invoke-Recovery -Level 2 } else { Invoke-Recovery -Level $level }
         Start-Sleep -Seconds ($GraceSec + [Math]::Min(($level - 1) * 30, 120))
         $unhealthySince = Get-Date
     } catch {
