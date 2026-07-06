@@ -1,0 +1,16 @@
+# Runtime + personal data — never commit (contains device serials, timestamps,
+# usage/idle/power telemetry, and other machine-specific state).
+*.log
+Tobii-Watchdog-*.log
+Tobii-Telemetry*.jsonl
+watchdog.pause
+tray.settings.json
+Tobii-Diagnostics/
+snapshots/
+
+# Self-deleting elevated helper scripts (generated at runtime)
+_*.ps1
+
+*.tmp
+Thumbs.db
+desktop.ini

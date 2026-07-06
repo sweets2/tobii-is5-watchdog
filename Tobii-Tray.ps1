@@ -1,0 +1,167 @@
+<#
+    Tobii-Tray.ps1  - system-tray control for the Tobii watchdog.
+    Left-click the tray icon = Pause/Resume.  Right-click = menu.
+    Icon: green = active, gray = paused (manual), orange = auto-paused (game).
+
+    It controls the watchdog purely by creating/removing a flag file
+    (C:\Scripts\watchdog.pause). No admin needed. Settings persist to
+    C:\Scripts\tray.settings.json.
+#>
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+Add-Type @"
+using System;
+using System.Runtime.InteropServices;
+public static class NativeShell {
+    [DllImport("shell32.dll")]
+    public static extern int SHQueryUserNotificationState(out int state);
+}
+"@
+
+$ScriptsDir = 'C:\Scripts'
+$PauseFlag  = Join-Path $ScriptsDir 'watchdog.pause'
+$Settings   = Join-Path $ScriptsDir 'tray.settings.json'
+$LogPath    = Join-Path $ScriptsDir 'Tobii-Watchdog.log'
+
+$state = @{ mode = 'active'; autoGames = $false }
+if (Test-Path $Settings) {
+    try { $j = Get-Content $Settings -Raw | ConvertFrom-Json
+          if ($j.mode) { $state.mode = "$($j.mode)" }
+          $state.autoGames = [bool]$j.autoGames } catch {}
+}
+function Save-Settings {
+    @{ mode = $state.mode; autoGames = $state.autoGames } | ConvertTo-Json |
+        Set-Content -LiteralPath $Settings -Encoding UTF8
+}
+
+function Test-FullscreenGame {
+    # QUNS_RUNNING_D3D_FULL_SCREEN = 3, QUNS_PRESENTATION_MODE = 4
+    $s = 0
+    try { [void][NativeShell]::SHQueryUserNotificationState([ref]$s) } catch { return $false }
+    return ($s -eq 3 -or $s -eq 4)
+}
+
+function New-DotIcon($color) {
+    $bmp = New-Object System.Drawing.Bitmap 16,16
+    $g = [System.Drawing.Graphics]::FromImage($bmp)
+    $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
+    $g.Clear([System.Drawing.Color]::Transparent)
+    $b = New-Object System.Drawing.SolidBrush $color
+    $g.FillEllipse($b, 2,2,12,12)
+    $b.Dispose(); $g.Dispose()
+    $ico = [System.Drawing.Icon]::FromHandle($bmp.GetHicon())
+    $bmp.Dispose()
+    return $ico
+}
+$icoActive = New-DotIcon ([System.Drawing.Color]::LimeGreen)
+$icoPaused = New-DotIcon ([System.Drawing.Color]::Gray)
+$icoGame   = New-DotIcon ([System.Drawing.Color]::Orange)
+
+$ni   = New-Object System.Windows.Forms.NotifyIcon
+$menu = New-Object System.Windows.Forms.ContextMenuStrip
+$ni.ContextMenuStrip = $menu
+
+$miStatus    = New-Object System.Windows.Forms.ToolStripMenuItem "Status"
+$miStatus.Enabled = $false
+$miReconnect = New-Object System.Windows.Forms.ToolStripMenuItem "Reconnect now (fix a freeze)"
+$miToggle    = New-Object System.Windows.Forms.ToolStripMenuItem "Pause auto-recovery"
+$miAuto      = New-Object System.Windows.Forms.ToolStripMenuItem "Auto-pause in fullscreen games"
+$miAuto.CheckOnClick = $true
+$miAuto.Checked = [bool]$state.autoGames
+$miStats  = New-Object System.Windows.Forms.ToolStripMenuItem "Health report"
+$miLog    = New-Object System.Windows.Forms.ToolStripMenuItem "Open log"
+$miTelem  = New-Object System.Windows.Forms.ToolStripMenuItem "Open telemetry folder"
+$miExit   = New-Object System.Windows.Forms.ToolStripMenuItem "Exit tray (watchdog keeps running)"
+$sep1 = New-Object System.Windows.Forms.ToolStripSeparator
+$sep2 = New-Object System.Windows.Forms.ToolStripSeparator
+$sep3 = New-Object System.Windows.Forms.ToolStripSeparator
+[void]$menu.Items.Add($miStatus)
+[void]$menu.Items.Add($sep1)
+[void]$menu.Items.Add($miReconnect)
+[void]$menu.Items.Add($sep2)
+[void]$menu.Items.Add($miToggle)
+[void]$menu.Items.Add($miAuto)
+[void]$menu.Items.Add($sep3)
+[void]$menu.Items.Add($miStats)
+[void]$menu.Items.Add($miLog)
+[void]$menu.Items.Add($miTelem)
+[void]$menu.Items.Add($miExit)
+
+function Apply-State {
+    $gameActive = $false
+    if ($state.autoGames) { $gameActive = Test-FullscreenGame }
+    $effPaused = ($state.mode -eq 'paused') -or $gameActive
+
+    if ($effPaused) {
+        if (-not (Test-Path $PauseFlag)) { New-Item -ItemType File -Path $PauseFlag -Force | Out-Null }
+    } else {
+        if (Test-Path $PauseFlag) { Remove-Item $PauseFlag -Force -ErrorAction SilentlyContinue }
+    }
+
+    if ($state.mode -eq 'paused')   { $ni.Icon = $icoPaused; $txt = 'Paused (manual)' }
+    elseif ($gameActive)            { $ni.Icon = $icoGame;   $txt = 'Auto-paused (game)' }
+    else                            { $ni.Icon = $icoActive; $txt = 'Active' }
+
+    $ni.Text       = "Tobii Watchdog: $txt"
+    $miStatus.Text = "Status: $txt"
+    $miToggle.Text = if ($state.mode -eq 'paused') { 'Resume auto-recovery' } else { 'Pause auto-recovery' }
+    $miAuto.Checked = [bool]$state.autoGames
+}
+
+function Invoke-ReconnectNow {
+    # Fires the elevated on-demand task (no UAC prompt for the user).
+    try {
+        Start-ScheduledTask -TaskName 'TobiiReconnect' -ErrorAction Stop
+        $ni.ShowBalloonTip(3000, 'Tobii', 'Reconnecting the eye tracker...', [System.Windows.Forms.ToolTipIcon]::Info)
+    } catch {
+        $ni.ShowBalloonTip(4000, 'Tobii', 'Reconnect task not found. Re-run the installer.', [System.Windows.Forms.ToolTipIcon]::Warning)
+    }
+}
+
+function Toggle-Pause {
+    $state.mode = if ($state.mode -eq 'paused') { 'active' } else { 'paused' }
+    Save-Settings; Apply-State
+}
+
+$miReconnect.add_Click({ Invoke-ReconnectNow })
+$miToggle.add_Click({ Toggle-Pause })
+$miAuto.add_Click({ $state.autoGames = $miAuto.Checked; Save-Settings; Apply-State })
+$miStats.add_Click({
+    try {
+        $out = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File 'C:\Scripts\Tobii-Monitor.ps1' -Stats 2>&1 | Out-String
+        if (-not $out) { $out = 'No telemetry yet.' }
+        [System.Windows.Forms.MessageBox]::Show($out, 'Tobii Health Report') | Out-Null
+    } catch { [System.Windows.Forms.MessageBox]::Show("Couldn't run report: $($_.Exception.Message)", 'Tobii') | Out-Null }
+})
+$miLog.add_Click({ if (Test-Path $LogPath) { Start-Process notepad.exe $LogPath } })
+$miTelem.add_Click({ Start-Process explorer.exe 'C:\Scripts' })
+$miExit.add_Click({ $ni.Visible = $false; $ni.Dispose(); [System.Windows.Forms.Application]::Exit() })
+$ni.add_MouseClick({ param($s,$e) if ($e.Button -eq [System.Windows.Forms.MouseButtons]::Left) { Toggle-Pause } })
+
+$timer = New-Object System.Windows.Forms.Timer
+$timer.Interval = 3000
+$timer.add_Tick({ Apply-State })   # refresh icon + re-check fullscreen when auto is on
+
+# Instant reaction to power-source and display changes (event-driven, ~0 idle cost).
+# Both funnel into the TobiiWatchdog-OnWake task, which only reconnects if the
+# engine actually dropped (WaitingForDevice) and never during calibration.
+$script:lastEventCheck = [datetime]::MinValue
+function Fire-EventCheck {
+    param([string]$why)
+    if (((Get-Date) - $script:lastEventCheck).TotalSeconds -lt 25) { return }  # debounce bursts
+    $script:lastEventCheck = Get-Date
+    try { Start-ScheduledTask -TaskName 'TobiiWatchdog-OnWake' -ErrorAction SilentlyContinue } catch {}
+}
+[Microsoft.Win32.SystemEvents]::add_PowerModeChanged({
+    param($s,$e)
+    if ($e.Mode -eq [Microsoft.Win32.PowerModes]::StatusChange -or $e.Mode -eq [Microsoft.Win32.PowerModes]::Resume) { Fire-EventCheck 'power' }
+})
+[Microsoft.Win32.SystemEvents]::add_DisplaySettingsChanged({ Fire-EventCheck 'display' })
+
+$ni.Visible = $true
+Apply-State
+$timer.Start()
+[System.Windows.Forms.Application]::Run()
+
+# Detach handlers on exit (avoids a leaked SystemEvents subscription).
+[Microsoft.Win32.SystemEvents]::remove_DisplaySettingsChanged({ Fire-EventCheck 'display' })
