@@ -40,14 +40,23 @@ Full evidence, quantified logs, and the three distinct failure modes are in
 
 ## Install
 
-1. Clone/download into `C:\Scripts` (the scripts default to that path).
-2. In an **elevated PowerShell**:
-   ```powershell
-   powershell -ExecutionPolicy Bypass -File "C:\Scripts\Install-TobiiWatchdog.ps1"
-   ```
-3. A green dot appears in your system tray. Done — it runs at every logon.
+**Easiest — one click:**
+1. Download this repo (green **Code** button → **Download ZIP**) and unzip it anywhere.
+2. Double-click **`Install.bat`** → approve the admin prompt.
+   It copies the tool into `C:\Scripts`, sets everything up, and starts it.
+3. A **green dot** appears in your system tray. Done — it runs at every logon.
 
-**Uninstall:** `powershell -ExecutionPolicy Bypass -File "C:\Scripts\Uninstall-TobiiWatchdog.ps1"`
+**To remove:** double-click **`Uninstall.bat`**.
+
+<details>
+<summary>Manual install (PowerShell)</summary>
+
+Put the files in `C:\Scripts`, then in an **elevated PowerShell**:
+```powershell
+powershell -ExecutionPolicy Bypass -File "C:\Scripts\Install-TobiiWatchdog.ps1"
+```
+Uninstall: `powershell -ExecutionPolicy Bypass -File "C:\Scripts\Uninstall-TobiiWatchdog.ps1"`
+</details>
 
 ## How it works / what it catches
 

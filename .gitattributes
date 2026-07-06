@@ -1,0 +1,5 @@
+# Batch files must be CRLF or cmd.exe can misbehave.
+*.bat text eol=crlf
+*.vbs text eol=crlf
+*.ps1 text
+*.md  text
