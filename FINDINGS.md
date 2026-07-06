@@ -543,4 +543,22 @@ so it's redundant with this file.
   Reference: triggers that cause real connection drops (all caught) vs. non-connection
   modes (display-mapping, calibration-loss, invalid-gaze) documented in this session's
   reply — the fast-paths only help the connection-drop class.
+- **2026-07-06 evening — battery-died-in-sleep cold boot exposed a watchdog blind
+  spot; fixed with a passive stack-presence check.** Battery drained during sleep
+  → cold boot (not a resume). For ~3 min after logon there was no eye tracking and
+  the watchdog saw nothing wrong: `Tobii Service` is **Automatic (Delayed Start)**
+  (starts ~2+ min after boot), the engine process didn't exist, and the last
+  ServerLog state line still said `Tracking` from hours before the battery died —
+  the log-state check trusts a stale log across crash/boot. Manual "Reconnect now"
+  fixed it in ~20s. Also ruled out: Kernel-PnP event 219 at boot (`WudfRd` failed
+  to load for TobiiHidDriver) fires on every boot — an artifact, not a cause.
+  FIX (still fully passive — Get-Service/Get-Process only, never gaze): watchdog
+  now (1) trusts the log state only while `Tobii.EyeX.Engine` is alive; (2) treats
+  "`Tobii Service` not Running OR engine process absent" as a fault → recovery at
+  level 2 (level 1 runtime-restart can't start the middleware), same threshold +
+  calibration guard, plus a **240s post-boot grace** (`-BootGraceSec`) so it never
+  fights delayed auto-start; (3) `-OnWake` does the same stack check; (4) `-Once`
+  prints stack/trust status. Would have auto-recovered this incident ~1 min after
+  logon. Watch for false recoveries (e.g. Tobii Service legitimately stopped
+  long-term).
 - _(add the next change here)_
