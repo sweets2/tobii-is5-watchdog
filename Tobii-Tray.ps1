@@ -68,6 +68,7 @@ $miToggle    = New-Object System.Windows.Forms.ToolStripMenuItem "Pause auto-rec
 $miAuto      = New-Object System.Windows.Forms.ToolStripMenuItem "Auto-pause in fullscreen games"
 $miAuto.CheckOnClick = $true
 $miAuto.Checked = [bool]$state.autoGames
+$miDrops  = New-Object System.Windows.Forms.ToolStripMenuItem "Recent disconnects"
 $miStats  = New-Object System.Windows.Forms.ToolStripMenuItem "Health report"
 $miLog    = New-Object System.Windows.Forms.ToolStripMenuItem "Open log"
 $miTelem  = New-Object System.Windows.Forms.ToolStripMenuItem "Open telemetry folder"
@@ -82,6 +83,7 @@ $sep3 = New-Object System.Windows.Forms.ToolStripSeparator
 [void]$menu.Items.Add($miToggle)
 [void]$menu.Items.Add($miAuto)
 [void]$menu.Items.Add($sep3)
+[void]$menu.Items.Add($miDrops)
 [void]$menu.Items.Add($miStats)
 [void]$menu.Items.Add($miLog)
 [void]$menu.Items.Add($miTelem)
@@ -123,6 +125,44 @@ function Toggle-Pause {
     Save-Settings; Apply-State
 }
 
+function Show-Drops {
+    $tel = 'C:\Scripts\Tobii-Telemetry.jsonl'
+    $rows = @()
+    if (Test-Path $tel) {
+        $evts = Get-Content $tel -ErrorAction SilentlyContinue |
+            ForEach-Object { try { $_ | ConvertFrom-Json } catch {} } |
+            Where-Object { $_.evt -eq 'drop' -or $_.evt -eq 'recovered' }
+        foreach ($e in $evts) {
+            $t = ($e.ts -replace 'T',' ')
+            if ($e.evt -eq 'drop') {
+                $rows += ("{0}   *** DISCONNECT ***   (on {1}{2})" -f $t, $e.ac, $(if($e.batt){" $($e.batt)% batt"}else{''}))
+            } else {
+                $rows += ("{0}   recovered after {1}s" -f $t, $e.outageSec)
+            }
+        }
+    }
+    $dropCount = ($rows | Where-Object { $_ -match 'DISCONNECT' }).Count
+    if (-not $rows) { $rows = @('No disconnects recorded yet. (Good news!)') }
+    [array]::Reverse($rows)   # newest first
+    $header = "Recent Tobii disconnects  -  $dropCount total recorded (newest first)`r`n" + ('=' * 60)
+
+    $form = New-Object System.Windows.Forms.Form
+    $form.Text = 'Tobii - Recent disconnects'
+    $form.Size = New-Object System.Drawing.Size(560,440)
+    $form.StartPosition = 'CenterScreen'
+    $form.TopMost = $true
+    $tb = New-Object System.Windows.Forms.TextBox
+    $tb.Multiline = $true; $tb.ReadOnly = $true; $tb.ScrollBars = 'Vertical'
+    $tb.Dock = 'Fill'; $tb.WordWrap = $false
+    $tb.Font = New-Object System.Drawing.Font('Consolas', 9)
+    $tb.Text = $header + "`r`n" + ($rows -join "`r`n")
+    $tb.Select(0,0)
+    $form.Controls.Add($tb)
+    [void]$form.ShowDialog()
+    $form.Dispose()
+}
+
+$miDrops.add_Click({ Show-Drops })
 $miReconnect.add_Click({ Invoke-ReconnectNow })
 $miToggle.add_Click({ Toggle-Pause })
 $miAuto.add_Click({ $state.autoGames = $miAuto.Checked; Save-Settings; Apply-State })

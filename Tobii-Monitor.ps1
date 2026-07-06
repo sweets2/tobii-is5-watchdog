@@ -1,5 +1,5 @@
 <#
-    Tobii-Monitor.ps1  — passive telemetry recorder for the Tobii eye tracker.
+    Tobii-Monitor.ps1  - passive telemetry recorder for the Tobii eye tracker.
     ------------------------------------------------------------------------
     OBSERVE ONLY. It never touches the device and never subscribes to gaze, so
     it cannot affect tracking. Runs continuously (own task, non-elevated), samples
@@ -180,22 +180,24 @@ $mutex = New-Object System.Threading.Mutex($true, 'Global\TobiiMonitorSingleton'
 if (-not $createdNew) { exit 0 }   # another monitor already running
 
 # ---- sampling loop ---------------------------------------------------------
-$prevHealthy = $null; $dropAt = $null
+# A "drop" is only a genuine connection loss (WaitingForDevice). Transient/setup
+# states like Configuring (calibration) are NOT drops -- counting them inflated the
+# stats and made calibration look like an outage.
+$prevFault = $false; $dropAt = $null
 Get-Sample | Out-Null    # prime CPU deltas
 Start-Sleep -Seconds 2
 while ($true) {
     try {
         $s = Get-Sample
-        $healthy = ($s.state -eq $null) -or ($HealthyStates -contains $s.state)
-        # transition detection
-        if ($prevHealthy -eq $true -and -not $healthy) {
+        $isFault = ($s.state -eq 'WaitingForDevice')
+        if (-not $prevFault -and $isFault) {
             $s.evt = 'drop'; $dropAt = Get-Date
             Write-Snapshot 'drop'
-        } elseif ($prevHealthy -eq $false -and $healthy -and $dropAt) {
+        } elseif ($prevFault -and -not $isFault -and $dropAt) {
             $s.evt = 'recovered'; $s.outageSec = [int]((Get-Date)-$dropAt).TotalSeconds; $dropAt = $null
         }
         Write-Line $s
-        $prevHealthy = $healthy
+        $prevFault = $isFault
     } catch { }
     Start-Sleep -Seconds $SampleSec
 }
