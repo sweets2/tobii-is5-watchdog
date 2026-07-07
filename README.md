@@ -25,15 +25,15 @@ show no USB disconnect, no PnP removal, and no power event at the failure times.
 It's a bug in Tobii's closed-source stack for this legacy/integrated product, so it
 can't be patched — a supervisor that forces a reconnect is the pragmatic fix.
 
-Full evidence, quantified logs, and the three distinct failure modes are in
+Full evidence, quantified logs, and the five distinct failure modes (A–E) are in
 [`FINDINGS.md`](FINDINGS.md).
 
 ## What's included
 
 | Component | Role |
 |---|---|
-| `Tobii-Watchdog.ps1` | Passive log-state watchdog. Reads the engine's `ServerLog.txt` (never touches the gaze stream) and auto-recovers when it's stuck in `WaitingForDevice`. |
-| `Tobii-Tray.ps1` / `.vbs` | System-tray app: **Reconnect now**, Pause/Resume auto-recovery, auto-pause in fullscreen games, Health report. Instant reconnect on sleep/resume, power-source, and display changes. |
+| `Tobii-Watchdog.ps1` | Passive watchdog. Reads the engine's `ServerLog.txt` (never touches the gaze stream) and auto-recovers when it's stuck in `WaitingForDevice`. Also checks the stack is actually *running* (service + engine process), so a crash or dirty cold boot can't hide behind a stale "Tracking" log line. |
+| `Tobii-Tray.ps1` / `.vbs` | System-tray app: **Reconnect now**, **Fix cursor warp**, Pause/Resume auto-recovery, auto-pause in fullscreen games, Health report, Recent disconnects. Instant reconnect on sleep/resume, power-source, and display changes. |
 | `Tobii-Monitor.ps1` | Passive telemetry recorder (observe-only): logs drops/recoveries + snapshots to help diagnose. `-Stats` prints MTBF / drops-per-hour / outage lengths. |
 | `Install-TobiiWatchdog.ps1` | Registers the scheduled tasks + tray autostart, and disables USB selective suspend for the device. |
 | `Uninstall-TobiiWatchdog.ps1` | Removes everything. |
@@ -64,8 +64,16 @@ Uninstall: `powershell -ExecutionPolicy Bypass -File "C:\Scripts\Uninstall-Tobii
   trigger — sleep, AC/battery change, display change, heavy load, or the random
   PRP bug. Recovery escalates: restart runtime service → recycle the EyeX engine +
   services → (manual only) USB power-cycle.
-- **Safe by design:** it only *reads* the log, only acts on the one genuine fault
-  state, and never intervenes during calibration.
+- **Auto-recovers a dead stack** — if the Tobii service or engine process is
+  missing (crash, or a cold boot after the battery died in sleep), that's a fault
+  too, with a post-boot grace so it never fights the service's delayed autostart.
+- **Prevents the "cursor warp dead" wedge (Mode E):** after every full recovery it
+  waits for the engine to report a *fresh* `Tracking`, then bounces
+  `Tobii.EyeX.Interaction` so its touchpad (PTP) session binds against a live
+  engine. If gaze works but warp is dead anyway, the tray's **Fix cursor warp**
+  restarts just that process — no full reconnect, no recalibration risk.
+- **Safe by design:** it only *reads* the log, only acts on genuine fault
+  states, and never intervenes during calibration.
 - **What it can't auto-fix** (use the tray's manual **Reconnect now**, or
   recalibrate): a silent stall while still "Tracking", "streaming but no valid
   gaze", and calibration loss. These can't be detected without subscribing to the
