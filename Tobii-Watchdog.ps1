@@ -26,6 +26,7 @@
 
     Modes:  -Once  print state & exit   -ForceReconnect  full reconnect & exit
             -OnWake  resume-from-sleep reconnect if not tracking
+            -RestartInteraction  bounce Tobii.EyeX.Interaction (fix cursor warp)
 #>
 [CmdletBinding()]
 param(
@@ -39,7 +40,8 @@ param(
     [string]$ServerLog     = "",
     [switch]$Once,
     [switch]$ForceReconnect,
-    [switch]$OnWake
+    [switch]$OnWake,
+    [switch]$RestartInteraction
 )
 $ErrorActionPreference = 'Continue'
 # ONLY this state triggers recovery. Everything else -- Tracking, Idle, and all the
@@ -106,17 +108,17 @@ function Write-Log {
 }
 
 # ---- read engine state from the log (passive; never touches the device) ----
+function Get-ServerLogPath {
+    if ($ServerLog) { return $ServerLog }
+    $mine = Join-Path $env:LOCALAPPDATA 'Tobii\Tobii Interaction\ServerLog.txt'
+    if (Test-Path $mine) { return $mine }
+    $c = Get-ChildItem 'C:\Users\*\AppData\Local\Tobii\Tobii Interaction\ServerLog.txt' -EA SilentlyContinue |
+         Sort-Object LastWriteTime -Descending
+    if ($c) { return $c[0].FullName }
+    return $null
+}
 function Get-TrackerState {
-    $path = $ServerLog
-    if (-not $path) {
-        $mine = Join-Path $env:LOCALAPPDATA 'Tobii\Tobii Interaction\ServerLog.txt'
-        if (Test-Path $mine) { $path = $mine }
-        else {
-            $c = Get-ChildItem 'C:\Users\*\AppData\Local\Tobii\Tobii Interaction\ServerLog.txt' -EA SilentlyContinue |
-                 Sort-Object LastWriteTime -Descending
-            if ($c) { $path = $c[0].FullName }
-        }
-    }
+    $path = Get-ServerLogPath
     if (-not $path -or -not (Test-Path -LiteralPath $path)) { return $null }
     for ($i = 0; $i -lt 3; $i++) {
         try {
@@ -126,6 +128,24 @@ function Get-TrackerState {
         } catch { Start-Sleep -Milliseconds 300 }
     }
     return $null
+}
+function Get-TrackerStateStamped {
+    # Like Get-TrackerState, but also returns WHEN that state line was written
+    # (parsed from the log-header line above it), so callers can reject a stale
+    # 'Tracking' left over from before a restart.
+    $path = Get-ServerLogPath
+    if (-not $path -or -not (Test-Path -LiteralPath $path)) { return $null }
+    try {
+        $m = Select-String -LiteralPath $path -Pattern 'Now in state (\w+)' -Context 1,0 -EA Stop |
+             Select-Object -Last 1
+        if (-not $m) { return $null }
+        $ts = $null
+        $hdr = $m.Context.PreContext[0]
+        if ($hdr -match '^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})') {
+            $ts = [datetime]::ParseExact($Matches[1], 'yyyy-MM-dd HH:mm:ss', $null)
+        }
+        return [PSCustomObject]@{ State = $m.Matches[0].Groups[1].Value; Time = $ts }
+    } catch { return $null }
 }
 
 # ---- recovery actions ------------------------------------------------------
@@ -154,6 +174,47 @@ function Restart-EyeXEngine {
         $p | Stop-Process -Force -ErrorAction SilentlyContinue
     }
 }
+function Restart-InteractionProcess {
+    # Mode E fix ("gaze fine, cursor warp dead"): Tobii.EyeX.Interaction can come
+    # up with a dead PTP (touchpad-filter) session -- gaze works everywhere, but
+    # warp does nothing while the process still logs 'Flush sent', so there is NO
+    # log signature to auto-detect. Restarting it against an engine that is
+    # already Tracking re-binds the session. Tobii.Service does not respawn a
+    # killed interaction process, hence the manual-start fallback.
+    $exe = 'C:\Program Files (x86)\Tobii\Tobii EyeX Interaction\Tobii.EyeX.Interaction.exe'
+    $p = Get-Process -Name 'Tobii.EyeX.Interaction' -ErrorAction SilentlyContinue
+    if ($p) {
+        Write-Log ("Restarting Tobii.EyeX.Interaction (pid " + (($p | ForEach-Object { $_.Id }) -join ',') + ") to reset the PTP session.")
+        $p | Stop-Process -Force -ErrorAction SilentlyContinue
+    }
+    for ($i = 0; $i -lt 10; $i++) {
+        Start-Sleep -Seconds 1
+        if (Get-Process -Name 'Tobii.EyeX.Interaction' -ErrorAction SilentlyContinue) {
+            Write-Log 'Tobii.EyeX.Interaction respawned on its own.'
+            return
+        }
+    }
+    if (Test-Path -LiteralPath $exe) {
+        Write-Log 'No auto-respawn after 10s; starting Tobii.EyeX.Interaction directly.'
+        Start-Process -FilePath $exe
+    } else {
+        Write-Log "Interaction exe not found at '$exe'; cannot restart it." 'WARN'
+    }
+}
+function Wait-ForTracking {
+    # Waits until the engine reports a FRESH 'Tracking' (state line written after
+    # $Since), so a stale pre-restart line can't satisfy it.
+    param([int]$TimeoutSec = 90, [datetime]$Since = (Get-Date))
+    $t0 = Get-Date
+    while (((Get-Date) - $t0).TotalSeconds -lt $TimeoutSec) {
+        if (-not (Get-StackDownReason)) {
+            $s = Get-TrackerStateStamped
+            if ($s -and $s.State -eq 'Tracking' -and $s.Time -and $s.Time -gt $Since) { return $true }
+        }
+        Start-Sleep -Seconds 3
+    }
+    return $false
+}
 function Reset-UsbDevice {
     # Manual-only (aggressive). Verifies the device ends ENABLED (a bare
     # restart-device can leave it in problem code 22 = disabled).
@@ -177,15 +238,33 @@ function Invoke-Recovery {
     # AUTO recovery ladder -- no USB power-cycle (kept out of auto on purpose).
     param([int]$Level)
     if ($Level -le 1) { Restart-RuntimeService }
-    else              { Restart-EyeXEngine; Restart-RuntimeService; Restart-MiddlewareService }
+    else {
+        $t0 = Get-Date
+        Restart-EyeXEngine; Restart-RuntimeService; Restart-MiddlewareService
+        Invoke-PostRecoveryInteractionReset -Since $t0
+    }
 }
 function Invoke-FullReconnect {
     # MANUAL "fix it hard": USB power-cycle (verified) + full stack recycle.
     Write-Log 'Full reconnect: USB power-cycle + engine + services.'
+    $t0 = Get-Date
     Reset-UsbDevice
     Restart-EyeXEngine
     Restart-RuntimeService
     Restart-MiddlewareService
+    Invoke-PostRecoveryInteractionReset -Since $t0
+}
+function Invoke-PostRecoveryInteractionReset {
+    # After a full-stack restart the service respawns the interaction process
+    # BEFORE the engine reaches Tracking, and it can bind its PTP session dead
+    # (Mode E). Once the engine reports a fresh Tracking, bounce interaction so
+    # it binds against a live engine.
+    param([datetime]$Since)
+    if (Wait-ForTracking -TimeoutSec 90 -Since $Since) {
+        Restart-InteractionProcess
+    } else {
+        Write-Log 'Engine did not reach fresh Tracking within 90s; skipping interaction reset.' 'WARN'
+    }
 }
 
 # ---- one-shot modes --------------------------------------------------------
@@ -200,6 +279,12 @@ if ($Once) {
 if ($ForceReconnect) {
     Write-Log 'Manual -ForceReconnect requested.'
     Invoke-FullReconnect
+    Write-Log 'Done.'
+    exit 0
+}
+if ($RestartInteraction) {
+    Write-Log 'Manual -RestartInteraction requested (fix cursor warp).'
+    Restart-InteractionProcess
     Write-Log 'Done.'
     exit 0
 }

@@ -64,6 +64,7 @@ $ni.ContextMenuStrip = $menu
 $miStatus    = New-Object System.Windows.Forms.ToolStripMenuItem "Status"
 $miStatus.Enabled = $false
 $miReconnect = New-Object System.Windows.Forms.ToolStripMenuItem "Reconnect now (fix a freeze)"
+$miWarp      = New-Object System.Windows.Forms.ToolStripMenuItem "Fix cursor warp (gaze OK, warp dead)"
 $miToggle    = New-Object System.Windows.Forms.ToolStripMenuItem "Pause auto-recovery"
 $miAuto      = New-Object System.Windows.Forms.ToolStripMenuItem "Auto-pause in fullscreen games"
 $miAuto.CheckOnClick = $true
@@ -79,6 +80,7 @@ $sep3 = New-Object System.Windows.Forms.ToolStripSeparator
 [void]$menu.Items.Add($miStatus)
 [void]$menu.Items.Add($sep1)
 [void]$menu.Items.Add($miReconnect)
+[void]$menu.Items.Add($miWarp)
 [void]$menu.Items.Add($sep2)
 [void]$menu.Items.Add($miToggle)
 [void]$menu.Items.Add($miAuto)
@@ -164,6 +166,17 @@ function Show-Drops {
 
 $miDrops.add_Click({ Show-Drops })
 $miReconnect.add_Click({ Invoke-ReconnectNow })
+$miWarp.add_Click({
+    # Mode E: engine/gaze healthy but cursor warp dead (Experience tracks your
+    # face fine, warp does nothing). Restarting the interaction process re-binds
+    # its PTP session. Much gentler than a full reconnect.
+    try {
+        Start-ScheduledTask -TaskName 'TobiiFixWarp' -ErrorAction Stop
+        $ni.ShowBalloonTip(3000, 'Tobii', 'Restarting the interaction process (cursor warp)...', [System.Windows.Forms.ToolTipIcon]::Info)
+    } catch {
+        $ni.ShowBalloonTip(4000, 'Tobii', 'FixWarp task not found. Re-run the installer.', [System.Windows.Forms.ToolTipIcon]::Warning)
+    }
+})
 $miToggle.add_Click({ Toggle-Pause })
 $miAuto.add_Click({ $state.autoGames = $miAuto.Checked; Save-Settings; Apply-State })
 $miStats.add_Click({

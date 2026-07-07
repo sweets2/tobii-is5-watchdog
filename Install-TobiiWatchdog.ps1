@@ -132,6 +132,19 @@ Register-ScheduledTask -TaskName $rcName -Action $rcAction `
     -Description 'On-demand: force-reconnect the Tobii eye tracker (fired by the tray "Reconnect now").' | Out-Null
 Write-Host "   registered '$rcName' (on-demand, elevated)."
 
+Write-Host "== 2d2. Registering on-demand 'TobiiFixWarp' task (tray button) ==" -ForegroundColor Cyan
+$fwName = 'TobiiFixWarp'
+Unregister-ScheduledTask -TaskName $fwName -Confirm:$false -ErrorAction SilentlyContinue
+$fwAction = New-ScheduledTaskAction -Execute $psExe `
+    -Argument "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$watchdog`" -RestartInteraction"
+$fwSettings = New-ScheduledTaskSettingsSet -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Minutes 5) -MultipleInstances IgnoreNew
+# No trigger: on-demand only (tray "Fix cursor warp"). Restarts the interaction
+# process to re-bind its PTP session (Mode E: gaze fine, cursor warp dead).
+Register-ScheduledTask -TaskName $fwName -Action $fwAction `
+    -Principal $principal -Settings $fwSettings `
+    -Description 'On-demand: restart Tobii.EyeX.Interaction to fix a dead cursor warp (fired by the tray "Fix cursor warp").' | Out-Null
+Write-Host "   registered '$fwName' (on-demand, elevated)."
+
 Write-Host "== 2e. Registering passive 'TobiiMonitor' task (telemetry, non-elevated) ==" -ForegroundColor Cyan
 $monitor = Join-Path $ScriptDir 'Tobii-Monitor.ps1'
 $monName = 'TobiiMonitor'
