@@ -67,6 +67,7 @@ $miStatus    = New-Object System.Windows.Forms.ToolStripMenuItem "Status"
 $miStatus.Enabled = $false
 $miReconnect = New-Object System.Windows.Forms.ToolStripMenuItem "Reconnect now (fix a freeze)"
 $miWarp      = New-Object System.Windows.Forms.ToolStripMenuItem "Fix cursor warp (gaze OK, warp dead)"
+$miReapply   = New-Object System.Windows.Forms.ToolStripMenuItem "Re-apply saved calibration (no dots)"
 $miRecal     = New-Object System.Windows.Forms.ToolStripMenuItem "Recalibrate now (open Tobii app)"
 $miToggle    = New-Object System.Windows.Forms.ToolStripMenuItem "Pause auto-recovery"
 $miAuto      = New-Object System.Windows.Forms.ToolStripMenuItem "Auto-pause in fullscreen games"
@@ -84,6 +85,7 @@ $sep3 = New-Object System.Windows.Forms.ToolStripSeparator
 [void]$menu.Items.Add($sep1)
 [void]$menu.Items.Add($miReconnect)
 [void]$menu.Items.Add($miWarp)
+[void]$menu.Items.Add($miReapply)
 [void]$menu.Items.Add($miRecal)
 [void]$menu.Items.Add($sep2)
 [void]$menu.Items.Add($miToggle)
@@ -148,6 +150,29 @@ function Open-TobiiCalibration {
     $ni.ShowBalloonTip(5000, 'Tobii', 'Could not find the Tobii calibration app. Open it from the Start menu.', [System.Windows.Forms.ToolTipIcon]::Warning)
 }
 
+function Invoke-CalReapplyNow {
+    # Re-push the tracker's STORED calibration to the live engine (no restart, no
+    # dots) -- the fix for a hibernate-resume that came up with tracking dead. Runs
+    # as the logged-in user (this tray process), which is required to reach the engine.
+    $exe = 'C:\Scripts\Tobii-CalReapply.exe'
+    if (-not (Test-Path $exe)) {
+        $ni.ShowBalloonTip(4000, 'Tobii', 'Re-apply tool not found. Re-run the installer.', [System.Windows.Forms.ToolTipIcon]::Warning); return
+    }
+    $ni.ShowBalloonTip(3000, 'Tobii', 'Re-applying your saved calibration (no dots)...', [System.Windows.Forms.ToolTipIcon]::Info)
+    try {
+        $p = Start-Process -FilePath $exe -WindowStyle Hidden -Wait -PassThru -ErrorAction Stop
+        if ($p.ExitCode -eq 0) {
+            Remove-Item 'C:\Scripts\tobii-recal-needed.flag' -Force -ErrorAction SilentlyContinue
+            Apply-State
+            $ni.ShowBalloonTip(3000, 'Tobii', 'Saved calibration re-applied - tracking should be back.', [System.Windows.Forms.ToolTipIcon]::Info)
+        } else {
+            $ni.ShowBalloonTip(5000, 'Tobii', 'Could not re-apply the saved calibration - you may need to Recalibrate.', [System.Windows.Forms.ToolTipIcon]::Warning)
+        }
+    } catch {
+        $ni.ShowBalloonTip(4000, 'Tobii', 'Re-apply failed to start.', [System.Windows.Forms.ToolTipIcon]::Warning)
+    }
+}
+
 function Invoke-ReconnectNow {
     # Fires the elevated on-demand task (no UAC prompt for the user).
     try {
@@ -202,6 +227,7 @@ function Show-Drops {
 
 $miDrops.add_Click({ Show-Drops })
 $miReconnect.add_Click({ Invoke-ReconnectNow })
+$miReapply.add_Click({ Invoke-CalReapplyNow })
 $miWarp.add_Click({
     # Mode E: engine/gaze healthy but cursor warp dead (Experience tracks your
     # face fine, warp does nothing). Restarting the interaction process re-binds

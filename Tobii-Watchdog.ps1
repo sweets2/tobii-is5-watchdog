@@ -193,33 +193,103 @@ function Test-StallCleared {
     Write-Log 'Stall-recovery verify: user idle, cannot confirm; assuming cleared.'
     return $true
 }
+function Invoke-CalReapply {
+    # Mode-D primary fix: re-push the tracker's STORED calibration blob to the live
+    # engine (Tobii-CalReapply.exe, safe engine-IPC path -- NEVER a gaze stream).
+    # After a hibernate-resume the engine is 'Tracking' but no calibration is bound
+    # to the device (0% CPU, IR LEDs dark); re-applying the stored calibration.setpm
+    # rebinds it in ~1s with no restart and no recalibration dots. Returns $true if
+    # the push reported ResultCode Ok (exit 0).
+    $exe = 'C:\Scripts\Tobii-CalReapply.exe'
+    if (-not (Test-Path -LiteralPath $exe)) {
+        Write-Log 'Tobii-CalReapply.exe not present; cannot re-apply calibration.' 'WARN'
+        return $false
+    }
+    Write-Log 'Re-applying stored calibration to the live device (no restart, no dots)...'
+    try {
+        $out = & $exe 2>&1
+        $code = $LASTEXITCODE
+        foreach ($l in $out) { Write-Log ("  calreapply: $l") }
+        Write-Log ("Calibration re-apply " + $(if ($code -eq 0) { 'reported Ok.' } else { "failed (exit $code)." }))
+        return ($code -eq 0)
+    } catch {
+        Write-Log ("Calibration re-apply error: " + $_.Exception.Message) 'ERROR'
+        return $false
+    }
+}
+function Test-GazeWorking {
+    # Verify real gaze work resumed (engine CPU at tracking level while the user is
+    # present). Unlike Test-StallCleared this does NOT wait for a fresh 'Tracking'
+    # line -- a bare re-apply produces no state transition (the engine was already
+    # 'Tracking'); it just starts doing gaze work again.
+    Start-Sleep -Seconds 4
+    for ($i = 0; $i -lt 4; $i++) {
+        if ((Get-ConsoleIdleSec) -le $StallIdleMaxSec) {
+            $cpu = Get-EngineCpuPct -SampleSec 10
+            if ($null -ne $cpu) {
+                Write-Log ("Gaze-recovery verify: engine CPU ${cpu}%.")
+                return ($cpu -ge $StallCpuPct)
+            }
+        }
+        Start-Sleep -Seconds 8
+    }
+    Write-Log 'Gaze-recovery verify: user idle, cannot confirm; assuming cleared.'
+    return $true
+}
 function Invoke-StallRecovery {
-    # Ladder for the 'Tracking-but-dead' stall. Each step is verified by actual
-    # engine CPU, not by the state line (the state line is the thing that lies).
+    # Ladder for the 'Tracking-but-dead' stall (Mode B/D). Order changed now that we
+    # can re-bind calibration directly: try the cheap, non-disruptive calibration
+    # re-apply FIRST, and again after each disruptive step (a restart brings the
+    # engine back up uncalibrated -- the same Mode-D state -- so it must be followed
+    # by a re-apply). Each step is verified by actual engine CPU, not the state line.
     if ($script:LastStallRecovery -and ((Get-Date) - $script:LastStallRecovery).TotalMinutes -lt $StallCooldownMin) {
-        Write-Log 'Silent stall again within cooldown; flagging for recalibration instead of restarting again.' 'WARN'
-        Set-RecalNeeded 'stall persisted through recovery cooldown'
+        # Even inside the restart cooldown, a calibration re-apply is free (no restart)
+        # -- try it before resorting to the recalibration flag.
+        Write-Log 'Silent stall within restart cooldown; trying calibration re-apply before flagging.' 'WARN'
+        if ((Invoke-CalReapply) -and (Test-GazeWorking)) {
+            Write-Log 'Stall cleared by calibration re-apply (cooldown path).'
+            Clear-RecalNeeded 'calibration re-applied'
+            return
+        }
+        Set-RecalNeeded 'stall persisted; calibration re-apply did not restore gaze'
         return
     }
     $script:LastStallRecovery = Get-Date
-    Write-Log 'SILENT STALL confirmed: engine claims Tracking at idle CPU while user is active. Starting stall ladder.' 'ERROR'
+    Write-Log 'SILENT STALL confirmed: engine claims Tracking at idle CPU while user is active. Starting recovery.' 'ERROR'
+
+    # Step 0 -- primary Mode-D fix: re-apply stored calibration (fast, no restart).
+    if ((Invoke-CalReapply) -and (Test-GazeWorking)) {
+        Write-Log 'Stall cleared by calibration re-apply (no restart needed).'
+        Clear-RecalNeeded 'calibration re-applied'
+        return
+    }
+
+    # Step 1 -- stack restart, wait for a fresh Tracking, then re-apply calibration.
+    Write-Log 'Re-apply alone did not clear it; escalating to stack restart.' 'WARN'
     $t0 = Get-Date
     Invoke-Recovery -Level 2
-    if (Test-StallCleared -Since $t0) {
-        Write-Log 'Stall cleared by stack restart.'
+    if (Wait-ForTracking -TimeoutSec 90 -Since $t0) { Invoke-CalReapply | Out-Null }
+    if (Test-GazeWorking) {
+        Write-Log 'Stall cleared by stack restart + calibration re-apply.'
         Clear-RecalNeeded 'engine tracking again'
         return
     }
-    Write-Log 'Stall survived the stack restart; escalating to full reconnect (USB power-cycle).' 'WARN'
+
+    # Step 2 -- full reconnect (USB power-cycle), wait, then re-apply calibration.
+    Write-Log 'Stall survived stack restart; escalating to full reconnect (USB power-cycle).' 'WARN'
     $t1 = Get-Date
     Invoke-FullReconnect
-    if (Test-StallCleared -Since $t1) {
-        Write-Log 'Stall cleared by full reconnect.'
+    if (Wait-ForTracking -TimeoutSec 90 -Since $t1) { Invoke-CalReapply | Out-Null }
+    if (Test-GazeWorking) {
+        Write-Log 'Stall cleared by full reconnect + calibration re-apply.'
         Clear-RecalNeeded 'engine tracking again'
         return
     }
-    Write-Log 'Stall survived the full ladder; this is almost certainly lost calibration (Mode D).' 'ERROR'
-    Set-RecalNeeded 'auto-recovery exhausted; engine tracks nothing at 0% CPU'
+
+    # Exhausted: even re-applying the stored calibration did not bring gaze back --
+    # genuine loss (e.g. no stored calibration exists). Ask the user to recalibrate.
+    Write-Log 'Stall survived re-apply + full ladder; genuine calibration loss (recalibration needed).' 'ERROR'
+    Set-RecalNeeded 'auto-recovery + calibration re-apply exhausted'
 }
 
 # ---- logging ---------------------------------------------------------------
@@ -441,6 +511,23 @@ if ($OnWake) {
         Write-Log ("Resume: stack down ($down); reconnecting.") 'WARN'; Invoke-Recovery -Level 2
     } elseif (-not $down -and ($FaultStates -contains $s)) {
         Write-Log ("Resume: state '$s'; reconnecting.") 'WARN'; Invoke-Recovery -Level 2
+    } elseif (-not $down -and ($s -eq 'Tracking' -or $s -eq 'Idle')) {
+        # Mode D: the classic hibernate-resume failure -- engine comes up 'Tracking'
+        # but with no calibration bound to the device (0% CPU, IR LEDs dark). If the
+        # user is present and the engine is doing no gaze work, re-apply the stored
+        # calibration immediately (fast, no restart, no dots) so gaze is back the
+        # moment they sit down instead of waiting for the periodic stall check.
+        $cpu = Get-EngineCpuPct -SampleSec 8
+        if ($null -ne $cpu -and $cpu -lt $StallCpuPct -and (Get-ConsoleIdleSec) -le $StallIdleMaxSec) {
+            Write-Log ("Resume: engine up but only ${cpu}% CPU (no calibration bound); re-applying stored calibration.") 'WARN'
+            if ((Invoke-CalReapply) -and (Test-GazeWorking)) {
+                Clear-RecalNeeded 'calibration re-applied on wake'
+            } else {
+                Write-Log 'Resume: re-apply did not restore gaze; leaving it to the stall ladder.' 'WARN'
+            }
+        } else {
+            Write-Log ("Resume: state '$s', engine CPU $(if($null -ne $cpu){"${cpu}%"}else{'n/a'}); no action.")
+        }
     } else { Write-Log "Resume: state '$(if($s){$s}else{'unknown'})'; no action." }
     exit 0
 }

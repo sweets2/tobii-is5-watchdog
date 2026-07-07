@@ -22,4 +22,6 @@ Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction Silen
     ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
 Remove-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' -Name 'TobiiTray' -ErrorAction SilentlyContinue
 Remove-Item 'C:\Scripts\watchdog.pause' -Force -ErrorAction SilentlyContinue
-Write-Host "removed tray autostart + pause flag" -ForegroundColor Green
+Remove-Item 'C:\Scripts\tobii-recal-needed.flag' -Force -ErrorAction SilentlyContinue
+Remove-Item 'C:\Scripts\Tobii-CalReapply.exe' -Force -ErrorAction SilentlyContinue
+Write-Host "removed tray autostart + pause/recal flags + calibration helper" -ForegroundColor Green

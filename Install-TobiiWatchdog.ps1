@@ -70,6 +70,28 @@ try {
     Write-Host "   (skipped global powercfg tweak: $($_.Exception.Message))" -ForegroundColor Yellow
 }
 
+Write-Host "== 1b. Building the calibration re-apply helper (Mode-D auto-fix) ==" -ForegroundColor Cyan
+# Tobii-CalReapply.exe re-pushes the stored calibration to the engine after a
+# hibernate-resume (no restart, no dots). Compiled here against the local Tobii
+# assemblies with the built-in .NET Framework compiler; x86 to match the SDK.
+$calSrc   = Join-Path $ScriptDir 'Tobii-CalReapply.cs'
+$calExe   = Join-Path $ScriptDir 'Tobii-CalReapply.exe'
+$tobiiCfg = 'C:\Program Files (x86)\Tobii\Tobii Configuration'
+$csc      = Join-Path $env:SystemRoot 'Microsoft.NET\Framework\v4.0.30319\csc.exe'
+if ((Test-Path $calSrc) -and (Test-Path $csc) -and (Test-Path $tobiiCfg)) {
+    try {
+        $refModel = Join-Path $tobiiCfg 'Tobii.Interaction.Model.dll'
+        $refNet   = Join-Path $tobiiCfg 'Tobii.Interaction.Net.dll'
+        & $csc /nologo /platform:x86 /target:exe /out:"$calExe" "/reference:$refModel" "/reference:$refNet" "$calSrc" 2>&1 | Out-Null
+        if (Test-Path $calExe) { Write-Host "   built Tobii-CalReapply.exe." }
+        else { Write-Host "   WARN: compile produced no exe; Mode-D auto-fix unavailable (recalibration still works)." -ForegroundColor Yellow }
+    } catch {
+        Write-Host "   WARN: could not build Tobii-CalReapply.exe: $($_.Exception.Message)" -ForegroundColor Yellow
+    }
+} else {
+    Write-Host "   (skipped: needs Tobii Configuration + csc.exe. Mode-D auto-fix unavailable; recalibration still works.)" -ForegroundColor Yellow
+}
+
 Write-Host "== 2. Registering scheduled task 'TobiiWatchdog' ==" -ForegroundColor Cyan
 
 $taskName = 'TobiiWatchdog'

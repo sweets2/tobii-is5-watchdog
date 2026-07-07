@@ -134,6 +134,50 @@ is the correct, pragmatic fix — not a lazy band-aid.
 
 Modes B & C are handled by the **manual "Reconnect now"** tray button, not auto-detection.
 
+### THE MODE-D FIX: re-apply stored calibration without recalibrating
+
+**Solved.** After a hibernate-resume the EyeX engine comes up in the `Tracking`
+state but with **no calibration bound to the live device** (0% CPU, IR LEDs dark).
+The calibration is *volatile firmware state* wiped when hibernate cuts tracker power;
+**no restart, USB power-cycle, or boot-order trick re-binds it** (all tested — see the
+"what does NOT work" note below). The only thing that does is re-pushing the stored
+calibration blob to the engine — which, until now, only the recalibration UI did.
+
+We found the safe primitive by decompiling the Tobii stack:
+
+```
+Tobii.Interaction.Host  ->  IContext.SetProfileCalibrationDataAsync(
+        profileName, trackerUri, timestamp, numPoints, byte[] calibrationData, handler)
+```
+
+This goes through the **EyeX engine over IPC** (the same channel the interaction app
+uses) — **not** a raw Stream Engine gaze subscription (that resets this hardware; see
+§6). `Tobii-CalReapply.exe` (built from `Tobii-CalReapply.cs`) does exactly this:
+
+1. Reads the current profile + tracker URI from the registry
+   (`HKLM\SOFTWARE\WOW6432Node\Tobii\EyeXConfig\CurrentUserProfile` / `DefaultEyeTracker`).
+2. Loads the stored calibration blob from the tracker's `calibration.setpm`
+   (`C:\ProgramData\Tobii\Tobii Platform Runtime\<model>\<serial>\calibration.setpm`).
+   The `.setpm` is a **16-byte header + the raw EyeX calibration blob**, so it strips
+   the header and passes the remainder as `calibrationData`.
+3. Connects a `Host`, calls `SetProfileCalibrationDataAsync(...)`, waits for
+   `ResultCode.Ok`, disconnects.
+
+Verified live on a hibernate-dead device: engine CPU jumped **0.5% → ~30–40%**, IR
+LEDs came back, gaze worked — **with zero recalibration dots.** It also registers the
+calibration for the *current* serial (the profile previously only had a stale entry
+for an old serial), which is likely why resume lost it in the first place.
+
+The watchdog now runs this **first** in its stall ladder and on resume, so Mode D
+self-heals in ~1s with no restart; the red "recalibrate" flag is only raised if even
+this fails (no stored calibration to re-apply). Manual trigger: tray → **Re-apply
+saved calibration**.
+
+> ⚠️ Note: this uses the **`Tobii.Interaction` engine-IPC** path only. Do **not** be
+> tempted by `ConnectedEyeTracker.SetCalibration()` in `Tobii.Configuration.Common` —
+> that one is built on the **Stream Engine** (opens a raw device connection) and is the
+> §6 hazard.
+
 ### 5a. Physical signal: the IR illuminator LEDs go DARK on every drop
 
 Reported behavior: **every time tracking stops, the visible IR illuminator LEDs in

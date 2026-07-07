@@ -14,3 +14,7 @@ _*.ps1
 *.tmp
 Thumbs.db
 desktop.ini
+
+# compiled calibration helper (built by installer via csc)
+Tobii-CalReapply.exe
+_*.exe

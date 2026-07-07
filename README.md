@@ -35,7 +35,8 @@ Full evidence, quantified logs, and the five distinct failure modes (A–E) are 
 | `Tobii-Watchdog.ps1` | Passive watchdog. Reads the engine's `ServerLog.txt` (never touches the gaze stream) and auto-recovers when it's stuck in `WaitingForDevice`. Also checks the stack is actually *running* (service + engine process), so a crash or dirty cold boot can't hide behind a stale "Tracking" log line — and catches the **silent stall** where the engine *claims* Tracking but does no gaze work (near-zero CPU while you're actively at the machine). |
 | `Tobii-Tray.ps1` / `.vbs` | System-tray app: **Reconnect now**, **Fix cursor warp**, **Recalibrate now**, Pause/Resume auto-recovery, auto-pause in fullscreen games, Health report, Recent disconnects. Instant reconnect on sleep/resume, power-source, and display changes. Turns **red + notifies you** when the watchdog determines a recalibration is needed. |
 | `Tobii-Monitor.ps1` | Passive telemetry recorder (observe-only): logs drops/recoveries + snapshots to help diagnose. `-Stats` prints MTBF / drops-per-hour / outage lengths. |
-| `Install-TobiiWatchdog.ps1` | Registers the scheduled tasks + tray autostart, and disables USB selective suspend for the device. |
+| `Tobii-CalReapply.cs` → `.exe` | The **Mode-D fix**: re-pushes the tracker's *stored* calibration to the live engine after a hibernate-resume — **no restart, no recalibration dots**. Uses the safe engine-IPC path (`Tobii.Interaction`), never a raw gaze stream. Compiled by the installer with the built-in .NET compiler. |
+| `Install-TobiiWatchdog.ps1` | Registers the scheduled tasks + tray autostart, disables USB selective suspend for the device, and builds `Tobii-CalReapply.exe`. |
 | `Uninstall-TobiiWatchdog.ps1` | Removes everything. |
 
 ## Install
@@ -72,23 +73,29 @@ Uninstall: `powershell -ExecutionPolicy Bypass -File "C:\Scripts\Uninstall-Tobii
   `Tobii.EyeX.Interaction` so its touchpad (PTP) session binds against a live
   engine. If gaze works but warp is dead anyway, the tray's **Fix cursor warp**
   restarts just that process — no full reconnect, no recalibration risk.
-- **Catches the "Tracking" lie (silent stall / lost calibration):** the engine
-  can claim `Tracking` while doing no gaze work at all (seen live: 22 minutes at
-  ~0.3% CPU after the device came back without usable calibration; healthy
-  tracking runs ~8–13%). The watchdog samples engine CPU while you're *actively
-  giving input* (so it should be seeing your eyes) — still fully passive, no
-  gaze subscription. On a confirmed stall it runs the ladder (stack restart →
-  USB power-cycle reconnect), verifying each step by actual CPU; if nothing
-  brings gaze back it's calibration loss, so the tray goes **red**, notifies
-  you, and one click opens the Tobii calibration app. The flag self-clears when
-  you recalibrate.
+- **Auto-fixes lost calibration after hibernate (Mode D) — no recalibration:**
+  the engine can claim `Tracking` while doing no gaze work at all (seen live: 22
+  minutes at ~0.3% CPU; healthy tracking runs ~8–13%; the IR LEDs go dark). This
+  is the classic hibernate-resume failure: the tracker's calibration is volatile
+  firmware state, wiped when hibernate cuts its power, and no restart re-binds it.
+  The watchdog samples engine CPU while you're *actively giving input* (still
+  fully passive, no gaze subscription) and, on a confirmed stall, **re-applies
+  your *stored* calibration to the engine** (`Tobii-CalReapply.exe`) — the same
+  thing the calibration UI does, minus the dots — in about a second, with no
+  restart. This runs first (it's cheap and non-disruptive); only if it *and* the
+  full restart/USB-power-cycle ladder fail to bring gaze back (e.g. no stored
+  calibration exists) does the tray go **red** and ask you to recalibrate. On
+  resume it also fires immediately, so gaze is back the moment you sit down.
+  There's a manual **"Re-apply saved calibration"** tray item too.
 - **Safe by design:** it only *reads* the log, only acts on genuine fault
   states, and never intervenes during calibration.
-- **What it can't auto-fix:** the recalibration itself (needs your eyes on the
-  calibration dots — it detects and notifies instead), and the rare "streaming
-  but invalid gaze" freeze, which has no passive signature while the user is
-  away. Detecting that would need a gaze-stream subscription — which **breaks
-  this hardware** (see FINDINGS §6). Don't do it.
+- **What it can't auto-fix:** a *first-time* or genuinely corrupt calibration —
+  if no valid calibration was ever stored, there's nothing to re-apply and you
+  must do the dots once (it detects and notifies). And the rare "streaming but
+  invalid gaze" freeze, which has no passive signature while the user is away;
+  detecting that would need a gaze-stream subscription — which **breaks this
+  hardware** (see FINDINGS §6). Don't do it. (Ordinary hibernate calibration
+  loss is now auto-fixed by the re-apply above — no dots needed.)
 
 ## Compatibility
 
