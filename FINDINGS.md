@@ -561,4 +561,26 @@ so it's redundant with this file.
   prints stack/trust status. Would have auto-recovered this incident ~1 min after
   logon. Watch for false recoveries (e.g. Tobii Service legitimately stopped
   long-term).
+- **2026-07-06 late evening — MODE E discovered & fixed: "gaze fine, cursor warp
+  dead" = Tobii.EyeX.Interaction's PTP session wedged.** Incident investigated
+  live before recovery. Every layer healthy: device OK, runtime log clean, engine
+  Tracking at normal CPU, Experience face tracking fine — yet cursor warp did
+  nothing. KEY INSIGHT: warp is delivered by `Tobii.EyeX.Interaction` sending
+  phantom-touch input through the **Tobii Touchpad Filter Driver** on the
+  physical precision touchpad; the InteractionLog keeps logging "PTP
+  communication: Flush sent" (and warp conceal/restore events) into the dead
+  pipe with no error, so there is NO passive log signature. Broken-vs-healthy
+  startup logs are identical. Proven by the fix: restarting ONLY the interaction
+  process restored warp instantly. Learned: Tobii.Service does NOT respawn a
+  killed interaction process, and it runs elevated (non-admin Stop-Process
+  denied). Likely trigger: a full-stack restart respawns interaction seconds
+  BEFORE the engine reaches Tracking; it binds a dead PTP session and never
+  retries. FIXES: (1) watchdog `-RestartInteraction` mode; (2) prevention —
+  after level-2 recovery / -ForceReconnect the watchdog waits (≤90s) for a FRESH
+  `Tracking` line (timestamp-checked) then bounces interaction; (3) tray "Fix
+  cursor warp" → on-demand elevated `TobiiFixWarp` task (installer registers
+  it). Failure modes now: A=WaitingForDevice drop (auto), B=stalled gaze
+  timestamps (blind), C=streaming-but-invalid (blind), D=calibration lost
+  (profile = `...\Tobii Platform Runtime\<platform>\<serial>\calibration.setpm`),
+  E=interaction PTP wedge (FixWarp; auto-prevented after recoveries).
 - _(add the next change here)_
