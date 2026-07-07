@@ -134,6 +134,30 @@ is the correct, pragmatic fix — not a lazy band-aid.
 
 Modes B & C are handled by the **manual "Reconnect now"** tray button, not auto-detection.
 
+### 5a. Physical signal: the IR illuminator LEDs go DARK on every drop
+
+Reported behavior: **every time tracking stops, the visible IR illuminator LEDs in
+the tracker bezel go out**, and return when it recovers. Interpretation:
+
+- The illuminators are driven by the **low-level runtime** / device firmware and only
+  pulse while there is an **active imaging session**. LEDs dark = the runtime has
+  **torn down the device's streaming session**, not merely a middleware hiccup. (If
+  only the engine's connection to the runtime dropped while the device kept imaging,
+  the LEDs would stay lit.)
+- **Not a contradiction with "Device Manager says OK."** The USB device stays
+  enumerated/powered (that's what DM reports); it just has no active tracking
+  session. Two different things.
+- Best interpretation: this is **downstream of** the connection loss (engine drops →
+  runtime stops streaming → illuminators power down), i.e. a *symptom*, not the
+  trigger — but it's the most reliable **human-visible ground truth** of a real drop,
+  more trustworthy than the log in the "Tracking"-lie / silent-stall case.
+- **Open question to resolve on the next silent stall (Mode B):** do the LEDs stay
+  on (session live, calibration/validity lost) or go dark (session torn down while
+  the log still claims `Tracking`)? A decisive data point either way.
+- **Cannot be used as a watchdog signal:** reading illuminator/camera state requires
+  opening a device/stream session, which resets this hardware (§6). LEDs stay a
+  manual eyeball check only.
+
 ---
 
 ## 6. ⚠️ CRITICAL LESSON: never subscribe to the gaze stream
@@ -611,4 +635,10 @@ so it's redundant with this file.
   `calibration.setpm` is rewritten (user recalibrated) or the stall clears.
   Modes B and D are now DETECTED (not blind); D still needs human eyes for the
   recalibration itself.
-- _(add the next change here)_
+- **IR illuminator LEDs go dark on every drop** (new section 5a). The visible IR
+  LEDs in the tracker bezel go out whenever tracking stops and return on recovery →
+  the runtime tears down the device's active imaging session (not just a middleware
+  glitch), consistent with and downstream of the connection-loss root cause. Best
+  human-visible ground truth that a drop is real; cannot be used as an automated
+  signal (sensing the LEDs = opening a device/stream session = the §6 hardware
+  reset). Action item: note LED state during a Mode B silent stall.
