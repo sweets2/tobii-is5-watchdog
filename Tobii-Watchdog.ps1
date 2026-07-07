@@ -20,9 +20,22 @@
     (and past a post-boot grace, since 'Tobii Service' is Automatic-Delayed and
     legitimately takes ~2-4 min to start after boot), that is a fault too.
 
+    SILENT-STALL CHECK (Mode B/D): the engine can claim 'Tracking' while doing
+    no gaze work at all -- seen live 2026-07-07 after a false recovery: state
+    said Tracking but the engine sat at ~0.3% CPU for 22 min (healthy tracking
+    with a user in front is ~8-13%) because the device had lost its calibration.
+    Detection is still fully passive: state == Tracking AND the console user is
+    actively giving input (so the tracker SHOULD be seeing eyes) AND engine CPU
+    stays at idle level across a sample window, twice in a row. Recovery ladder:
+    stack restart -> full reconnect (USB power-cycle) -> give up and raise the
+    'recalibration needed' flag, which the tray turns into a notification.
+    Caveat: typing with the tracker blind (lid closed on an external monitor)
+    looks identical; the cooldown caps that at one ladder per $StallCooldownMin.
+
     Recovery escalation (auto): 1 = restart runtime service; 2+ = kill+respawn
     EyeX engine, restart runtime + service. (No USB power-cycle in auto -- that
-    once left the device DISABLED; it's manual-only via -ForceReconnect.)
+    once left the device DISABLED; it's manual-only via -ForceReconnect and the
+    silent-stall ladder, both of which verify the device ends ENABLED.)
 
     Modes:  -Once  print state & exit   -ForceReconnect  full reconnect & exit
             -OnWake  resume-from-sleep reconnect if not tracking
@@ -38,6 +51,11 @@ param(
     [int]$MaxLogBytes      = 1048576,
     [string]$PauseFlag     = 'C:\Scripts\watchdog.pause',
     [string]$ServerLog     = "",
+    [double]$StallCpuPct       = 1.5,
+    [int]$StallIdleMaxSec      = 60,
+    [int]$StallCheckEverySec   = 60,
+    [int]$StallCooldownMin     = 45,
+    [string]$RecalFlag         = 'C:\Scripts\tobii-recal-needed.flag',
     [switch]$Once,
     [switch]$ForceReconnect,
     [switch]$OnWake,
@@ -80,6 +98,128 @@ try { $BootTime = (Get-CimInstance Win32_OperatingSystem -ErrorAction Stop).Last
 if (-not $BootTime) { $BootTime = (Get-Date).AddDays(-1) }  # unknown -> assume old boot, checks stay active
 function Test-InBootGrace {
     ((Get-Date) - $BootTime).TotalSeconds -lt $BootGraceSec
+}
+
+# ---- silent-stall detection (passive: process CPU + console idle only) ------
+# GetLastInputInfo tells us the console user is actively at the machine; if so,
+# the tracker should be seeing eyes and the engine should be burning CPU on
+# gaze processing. If Add-Type fails, Get-ConsoleIdleSec returns a huge value
+# and stall detection simply stays disabled.
+try {
+    Add-Type -ErrorAction Stop -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public static class TWLastInput {
+    [StructLayout(LayoutKind.Sequential)]
+    public struct LASTINPUTINFO { public uint cbSize; public uint dwTime; }
+    [DllImport("user32.dll")]
+    public static extern bool GetLastInputInfo(ref LASTINPUTINFO plii);
+    public static uint IdleMs() {
+        var lii = new LASTINPUTINFO();
+        lii.cbSize = (uint)Marshal.SizeOf(typeof(LASTINPUTINFO));
+        if (!GetLastInputInfo(ref lii)) return uint.MaxValue;
+        return (uint)Environment.TickCount - lii.dwTime;
+    }
+}
+'@
+} catch { }
+function Get-ConsoleIdleSec {
+    try { return [Math]::Round([TWLastInput]::IdleMs() / 1000) } catch { return 999999 }
+}
+function Get-EngineCpuPct {
+    # Average CPU % of the EyeX engine over a short sample window. Healthy
+    # tracking with a user present runs ~8-13%; a stalled/calibration-less
+    # engine sits at ~0-0.3%. Returns $null if the engine is absent or
+    # restarts mid-sample.
+    param([int]$SampleSec = 12)
+    $p1 = Get-Process -Name 'Tobii.EyeX.Engine' -ErrorAction SilentlyContinue | Select-Object -First 1
+    if (-not $p1) { return $null }
+    $cpu1 = $p1.CPU
+    Start-Sleep -Seconds $SampleSec
+    $p2 = Get-Process -Id $p1.Id -ErrorAction SilentlyContinue
+    if (-not $p2 -or $p2.ProcessName -ne 'Tobii.EyeX.Engine') { return $null }
+    return [Math]::Round((($p2.CPU - $cpu1) / $SampleSec) * 100, 1)
+}
+function Test-SilentStall {
+    # True only when ALL hold: stack up, engine claims Tracking, the user was
+    # giving input just now (tracker should see them), and engine CPU sampled
+    # at idle level. Cheap gates run first; the CPU sample blocks ~12s.
+    if (Get-StackDownReason) { return $false }
+    if ((Get-ConsoleIdleSec) -gt $StallIdleMaxSec) { return $false }
+    if ((Get-TrackerState) -ne 'Tracking') { return $false }
+    $cpu = Get-EngineCpuPct -SampleSec 12
+    if ($null -eq $cpu -or $cpu -ge $StallCpuPct) { return $false }
+    # user must still have been around during the sample window
+    if ((Get-ConsoleIdleSec) -gt ($StallIdleMaxSec + 15)) { return $false }
+    Write-Log ("Silent-stall sample: state=Tracking, engine CPU ${cpu}%, user active.") 'WARN'
+    return $true
+}
+function Get-CalibrationFile {
+    Get-ChildItem 'C:\ProgramData\Tobii\Tobii Platform Runtime\*\*\calibration.setpm' -ErrorAction SilentlyContinue |
+        Sort-Object LastWriteTime -Descending | Select-Object -First 1
+}
+function Set-RecalNeeded {
+    param([string]$Reason)
+    if (-not (Test-Path -LiteralPath $RecalFlag)) {
+        Write-Log ("Raising recalibration-needed flag: $Reason") 'ERROR'
+        try { Set-Content -LiteralPath $RecalFlag -Value ("{0} {1}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $Reason) } catch { }
+    }
+}
+function Clear-RecalNeeded {
+    param([string]$Why = '')
+    if (Test-Path -LiteralPath $RecalFlag) {
+        Write-Log ("Clearing recalibration-needed flag. $Why")
+        try { Remove-Item -LiteralPath $RecalFlag -Force -ErrorAction SilentlyContinue } catch { }
+    }
+}
+function Test-StallCleared {
+    # After a recovery step: wait for a fresh Tracking, then confirm the engine
+    # is actually working (CPU at tracking level while the user is present).
+    param([datetime]$Since)
+    if (-not (Wait-ForTracking -TimeoutSec 90 -Since $Since)) { return $false }
+    Start-Sleep -Seconds 5
+    for ($i = 0; $i -lt 6; $i++) {
+        if ((Get-ConsoleIdleSec) -le $StallIdleMaxSec) {
+            $cpu = Get-EngineCpuPct -SampleSec 10
+            if ($null -ne $cpu) {
+                Write-Log ("Stall-recovery verify: engine CPU ${cpu}%.")
+                return ($cpu -ge $StallCpuPct)
+            }
+        }
+        Start-Sleep -Seconds 10
+    }
+    # User stepped away mid-verification; assume cleared -- the periodic stall
+    # check will fire again if it is not.
+    Write-Log 'Stall-recovery verify: user idle, cannot confirm; assuming cleared.'
+    return $true
+}
+function Invoke-StallRecovery {
+    # Ladder for the 'Tracking-but-dead' stall. Each step is verified by actual
+    # engine CPU, not by the state line (the state line is the thing that lies).
+    if ($script:LastStallRecovery -and ((Get-Date) - $script:LastStallRecovery).TotalMinutes -lt $StallCooldownMin) {
+        Write-Log 'Silent stall again within cooldown; flagging for recalibration instead of restarting again.' 'WARN'
+        Set-RecalNeeded 'stall persisted through recovery cooldown'
+        return
+    }
+    $script:LastStallRecovery = Get-Date
+    Write-Log 'SILENT STALL confirmed: engine claims Tracking at idle CPU while user is active. Starting stall ladder.' 'ERROR'
+    $t0 = Get-Date
+    Invoke-Recovery -Level 2
+    if (Test-StallCleared -Since $t0) {
+        Write-Log 'Stall cleared by stack restart.'
+        Clear-RecalNeeded 'engine tracking again'
+        return
+    }
+    Write-Log 'Stall survived the stack restart; escalating to full reconnect (USB power-cycle).' 'WARN'
+    $t1 = Get-Date
+    Invoke-FullReconnect
+    if (Test-StallCleared -Since $t1) {
+        Write-Log 'Stall cleared by full reconnect.'
+        Clear-RecalNeeded 'engine tracking again'
+        return
+    }
+    Write-Log 'Stall survived the full ladder; this is almost certainly lost calibration (Mode D).' 'ERROR'
+    Set-RecalNeeded 'auto-recovery exhausted; engine tracks nothing at 0% CPU'
 }
 
 # ---- logging ---------------------------------------------------------------
@@ -274,6 +414,8 @@ if ($Once) {
     Write-Log ("Stack=$(if($down){'DOWN: '+$down}else{'up'})  bootGrace=$(Test-InBootGrace)")
     if (-not $s) { Write-Log "Could not read tracker state." 'WARN'; exit 1 }
     Write-Log ("State=$s  healthy=$([bool]($HealthyStates -contains $s))  trusted=$(-not $down)")
+    $cpu = Get-EngineCpuPct -SampleSec 5
+    Write-Log ("EngineCPU=$(if($null -ne $cpu){"${cpu}%"}else{'n/a'})  consoleIdle=$(Get-ConsoleIdleSec)s  recalFlag=$([bool](Test-Path -LiteralPath $RecalFlag))")
     exit 0
 }
 if ($ForceReconnect) {
@@ -310,8 +452,9 @@ if (-not $createdNew) { Write-Log 'Another watchdog instance is already running;
 
 # ---- main loop -------------------------------------------------------------
 Rotate-Log
-Write-Log "Tobii watchdog (log-state + stack-presence) started. threshold=${StuckThresholdSec}s poll=${PollSec}s grace=${GraceSec}s bootgrace=${BootGraceSec}s log=$LogPath"
+Write-Log "Tobii watchdog (log-state + stack-presence + silent-stall) started. threshold=${StuckThresholdSec}s poll=${PollSec}s grace=${GraceSec}s bootgrace=${BootGraceSec}s stall<${StallCpuPct}%cpu/${StallCheckEverySec}s cooldown=${StallCooldownMin}m log=$LogPath"
 $level = 0; $unhealthySince = $null; $iter = 0; $paused = $false
+$stallStrikes = 0; $lastStallCheck = Get-Date; $script:LastStallRecovery = $null
 while ($true) {
     try {
         if ((++$iter % 60) -eq 0) { Rotate-Log }
@@ -344,6 +487,36 @@ while ($true) {
         if (-not $fault) {
             if ($level -gt 0) { Write-Log "Recovered: state is now '$(if($s){$s}else{'unknown'})'." }
             $level = 0; $unhealthySince = $null
+
+            # If the recal flag is up and the calibration file has been rewritten
+            # since, the user recalibrated -- clear the flag.
+            if (Test-Path -LiteralPath $RecalFlag) {
+                $flagItem = Get-Item -LiteralPath $RecalFlag -ErrorAction SilentlyContinue
+                $calFile  = Get-CalibrationFile
+                if ($flagItem -and $calFile -and $calFile.LastWriteTime -gt $flagItem.LastWriteTime) {
+                    Clear-RecalNeeded 'calibration file rewritten (user recalibrated)'
+                    $script:LastStallRecovery = $null; $stallStrikes = 0
+                }
+            }
+
+            # Periodic silent-stall check (Mode B/D): 'Tracking' can be a lie.
+            # Two positive samples ~a minute apart before acting; never while
+            # the calibration UI is open.
+            if ($s -eq 'Tracking' -and -not (Test-ConfigActive) -and
+                ((Get-Date) - $lastStallCheck).TotalSeconds -ge $StallCheckEverySec) {
+                $lastStallCheck = Get-Date
+                if (Test-SilentStall) {
+                    $stallStrikes++
+                    if ($stallStrikes -ge 2) {
+                        $stallStrikes = 0
+                        Invoke-StallRecovery
+                        $lastStallCheck = Get-Date
+                    }
+                } else {
+                    $stallStrikes = 0
+                }
+            }
+
             Start-Sleep -Seconds $PollSec
             continue
         }

@@ -583,4 +583,32 @@ so it's redundant with this file.
   timestamps (blind), C=streaming-but-invalid (blind), D=calibration lost
   (profile = `...\Tobii Platform Runtime\<platform>\<serial>\calibration.setpm`),
   E=interaction PTP wedge (FixWarp; auto-prevented after recoveries).
+- **2026-07-07 midnight — MODE B/D caught live: the watchdog's first FALSE
+  recovery, and silent-stall detection built.** Timeline: the device flapped on
+  the USB bus (3 re-enumerations in 5s — `pr_log` "Could not get calibration
+  version for device" bursts in `setup_device_info`) → Mode A drop → watchdog
+  ran the ladder and logged "Recovered: state is now 'Tracking'" — **but the
+  engine was lying.** It sat 22 min claiming `Tracking` at ~0.3% CPU (healthy
+  tracking with a user present is **8–13%**), started only the *presence*
+  stream, never a gaze stream, and dropped straight into power save. The device
+  had come back **without usable calibration** (Experience prompted to
+  recalibrate; the on-disk `calibration.setpm` was intact — the device/runtime
+  just wouldn't load it, and calibration sync wrongly said "in sync"). Neither
+  an interaction bounce nor a full reconnect w/ USB power-cycle fixed it; ONLY
+  recalibrating did (which rewrites `calibration.setpm` — that timestamp is a
+  reliable "user recalibrated" signal). KEY INSIGHT: **engine CPU is a passive,
+  reliable gaze-health signal** — the missing detector for modes B/C/D — when
+  gated on the user actively giving console input (`GetLastInputInfo`), since
+  an idle engine is legitimate when nobody is in front (power save). FIXES:
+  (1) watchdog **silent-stall check**: every 60s while state=Tracking, if the
+  user is active (input <60s ago) and engine CPU <1.5% over a 12s sample, twice
+  in a row → stall ladder: stack restart → full reconnect (USB power-cycle) →
+  raise `tobii-recal-needed.flag`; every step verified by *actual CPU*, not the
+  state line; 45-min cooldown caps the lid-closed-on-external-monitor false
+  positive; (2) tray: red icon + balloon nag every 5 min while the flag is up,
+  "Recalibrate now" menu item + balloon click → opens the Tobii Experience app
+  (PackageFamilyName looked up live); (3) watchdog auto-clears the flag when
+  `calibration.setpm` is rewritten (user recalibrated) or the stall clears.
+  Modes B and D are now DETECTED (not blind); D still needs human eyes for the
+  recalibration itself.
 - _(add the next change here)_

@@ -22,6 +22,7 @@ $ScriptsDir = 'C:\Scripts'
 $PauseFlag  = Join-Path $ScriptsDir 'watchdog.pause'
 $Settings   = Join-Path $ScriptsDir 'tray.settings.json'
 $LogPath    = Join-Path $ScriptsDir 'Tobii-Watchdog.log'
+$RecalFlag  = Join-Path $ScriptsDir 'tobii-recal-needed.flag'
 
 $state = @{ mode = 'active'; autoGames = $false }
 if (Test-Path $Settings) {
@@ -56,6 +57,7 @@ function New-DotIcon($color) {
 $icoActive = New-DotIcon ([System.Drawing.Color]::LimeGreen)
 $icoPaused = New-DotIcon ([System.Drawing.Color]::Gray)
 $icoGame   = New-DotIcon ([System.Drawing.Color]::Orange)
+$icoRecal  = New-DotIcon ([System.Drawing.Color]::Red)
 
 $ni   = New-Object System.Windows.Forms.NotifyIcon
 $menu = New-Object System.Windows.Forms.ContextMenuStrip
@@ -65,6 +67,7 @@ $miStatus    = New-Object System.Windows.Forms.ToolStripMenuItem "Status"
 $miStatus.Enabled = $false
 $miReconnect = New-Object System.Windows.Forms.ToolStripMenuItem "Reconnect now (fix a freeze)"
 $miWarp      = New-Object System.Windows.Forms.ToolStripMenuItem "Fix cursor warp (gaze OK, warp dead)"
+$miRecal     = New-Object System.Windows.Forms.ToolStripMenuItem "Recalibrate now (open Tobii app)"
 $miToggle    = New-Object System.Windows.Forms.ToolStripMenuItem "Pause auto-recovery"
 $miAuto      = New-Object System.Windows.Forms.ToolStripMenuItem "Auto-pause in fullscreen games"
 $miAuto.CheckOnClick = $true
@@ -81,6 +84,7 @@ $sep3 = New-Object System.Windows.Forms.ToolStripSeparator
 [void]$menu.Items.Add($sep1)
 [void]$menu.Items.Add($miReconnect)
 [void]$menu.Items.Add($miWarp)
+[void]$menu.Items.Add($miRecal)
 [void]$menu.Items.Add($sep2)
 [void]$menu.Items.Add($miToggle)
 [void]$menu.Items.Add($miAuto)
@@ -102,7 +106,9 @@ function Apply-State {
         if (Test-Path $PauseFlag) { Remove-Item $PauseFlag -Force -ErrorAction SilentlyContinue }
     }
 
-    if ($state.mode -eq 'paused')   { $ni.Icon = $icoPaused; $txt = 'Paused (manual)' }
+    $recalNeeded = Test-Path $RecalFlag
+    if ($recalNeeded)               { $ni.Icon = $icoRecal;  $txt = 'RECALIBRATION NEEDED' }
+    elseif ($state.mode -eq 'paused') { $ni.Icon = $icoPaused; $txt = 'Paused (manual)' }
     elseif ($gameActive)            { $ni.Icon = $icoGame;   $txt = 'Auto-paused (game)' }
     else                            { $ni.Icon = $icoActive; $txt = 'Active' }
 
@@ -110,6 +116,36 @@ function Apply-State {
     $miStatus.Text = "Status: $txt"
     $miToggle.Text = if ($state.mode -eq 'paused') { 'Resume auto-recovery' } else { 'Pause auto-recovery' }
     $miAuto.Checked = [bool]$state.autoGames
+
+    # The watchdog raises this flag when its whole recovery ladder failed and
+    # the engine still tracks nothing: that is calibration loss (Mode D), which
+    # only human eyes can fix. Nag once on appearance, then every 5 minutes.
+    if ($recalNeeded) {
+        if (((Get-Date) - $script:lastRecalNag).TotalMinutes -ge 5) {
+            $script:lastRecalNag = Get-Date
+            $ni.ShowBalloonTip(15000, 'Tobii: recalibration needed',
+                'The eye tracker lost its calibration and auto-recovery could not fix it. Click here (or tray menu > Recalibrate now) to open the Tobii app and recalibrate.',
+                [System.Windows.Forms.ToolTipIcon]::Warning)
+        }
+    } else {
+        $script:lastRecalNag = [datetime]::MinValue
+    }
+}
+
+function Open-TobiiCalibration {
+    # Opens the Tobii Experience (Store) app, which hosts the calibration UI.
+    # Package family name is looked up live so nothing is hardcoded per-machine.
+    try {
+        $pkg = Get-AppxPackage -Name 'TobiiAB.TobiiEyeTrackingPortal' -ErrorAction Stop
+        if ($pkg) {
+            Start-Process explorer.exe "shell:AppsFolder\$($pkg.PackageFamilyName)!App"
+            return
+        }
+    } catch { }
+    # Fallback: legacy EyeX settings panel, if present.
+    $legacy = 'C:\Program Files (x86)\Tobii\Tobii EyeX Config\Tobii.EyeXConfig.exe'
+    if (Test-Path $legacy) { Start-Process $legacy; return }
+    $ni.ShowBalloonTip(5000, 'Tobii', 'Could not find the Tobii calibration app. Open it from the Start menu.', [System.Windows.Forms.ToolTipIcon]::Warning)
 }
 
 function Invoke-ReconnectNow {
@@ -177,6 +213,8 @@ $miWarp.add_Click({
         $ni.ShowBalloonTip(4000, 'Tobii', 'FixWarp task not found. Re-run the installer.', [System.Windows.Forms.ToolTipIcon]::Warning)
     }
 })
+$miRecal.add_Click({ Open-TobiiCalibration })
+$ni.add_BalloonTipClicked({ if (Test-Path $RecalFlag) { Open-TobiiCalibration } })
 $miToggle.add_Click({ Toggle-Pause })
 $miAuto.add_Click({ $state.autoGames = $miAuto.Checked; Save-Settings; Apply-State })
 $miStats.add_Click({
@@ -194,6 +232,8 @@ $ni.add_MouseClick({ param($s,$e) if ($e.Button -eq [System.Windows.Forms.MouseB
 $timer = New-Object System.Windows.Forms.Timer
 $timer.Interval = 3000
 $timer.add_Tick({ Apply-State })   # refresh icon + re-check fullscreen when auto is on
+
+$script:lastRecalNag = [datetime]::MinValue
 
 # Instant reaction to power-source and display changes (event-driven, ~0 idle cost).
 # Both funnel into the TobiiWatchdog-OnWake task, which only reconnects if the

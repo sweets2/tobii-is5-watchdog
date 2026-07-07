@@ -32,8 +32,8 @@ Full evidence, quantified logs, and the five distinct failure modes (A–E) are 
 
 | Component | Role |
 |---|---|
-| `Tobii-Watchdog.ps1` | Passive watchdog. Reads the engine's `ServerLog.txt` (never touches the gaze stream) and auto-recovers when it's stuck in `WaitingForDevice`. Also checks the stack is actually *running* (service + engine process), so a crash or dirty cold boot can't hide behind a stale "Tracking" log line. |
-| `Tobii-Tray.ps1` / `.vbs` | System-tray app: **Reconnect now**, **Fix cursor warp**, Pause/Resume auto-recovery, auto-pause in fullscreen games, Health report, Recent disconnects. Instant reconnect on sleep/resume, power-source, and display changes. |
+| `Tobii-Watchdog.ps1` | Passive watchdog. Reads the engine's `ServerLog.txt` (never touches the gaze stream) and auto-recovers when it's stuck in `WaitingForDevice`. Also checks the stack is actually *running* (service + engine process), so a crash or dirty cold boot can't hide behind a stale "Tracking" log line — and catches the **silent stall** where the engine *claims* Tracking but does no gaze work (near-zero CPU while you're actively at the machine). |
+| `Tobii-Tray.ps1` / `.vbs` | System-tray app: **Reconnect now**, **Fix cursor warp**, **Recalibrate now**, Pause/Resume auto-recovery, auto-pause in fullscreen games, Health report, Recent disconnects. Instant reconnect on sleep/resume, power-source, and display changes. Turns **red + notifies you** when the watchdog determines a recalibration is needed. |
 | `Tobii-Monitor.ps1` | Passive telemetry recorder (observe-only): logs drops/recoveries + snapshots to help diagnose. `-Stats` prints MTBF / drops-per-hour / outage lengths. |
 | `Install-TobiiWatchdog.ps1` | Registers the scheduled tasks + tray autostart, and disables USB selective suspend for the device. |
 | `Uninstall-TobiiWatchdog.ps1` | Removes everything. |
@@ -72,12 +72,23 @@ Uninstall: `powershell -ExecutionPolicy Bypass -File "C:\Scripts\Uninstall-Tobii
   `Tobii.EyeX.Interaction` so its touchpad (PTP) session binds against a live
   engine. If gaze works but warp is dead anyway, the tray's **Fix cursor warp**
   restarts just that process — no full reconnect, no recalibration risk.
+- **Catches the "Tracking" lie (silent stall / lost calibration):** the engine
+  can claim `Tracking` while doing no gaze work at all (seen live: 22 minutes at
+  ~0.3% CPU after the device came back without usable calibration; healthy
+  tracking runs ~8–13%). The watchdog samples engine CPU while you're *actively
+  giving input* (so it should be seeing your eyes) — still fully passive, no
+  gaze subscription. On a confirmed stall it runs the ladder (stack restart →
+  USB power-cycle reconnect), verifying each step by actual CPU; if nothing
+  brings gaze back it's calibration loss, so the tray goes **red**, notifies
+  you, and one click opens the Tobii calibration app. The flag self-clears when
+  you recalibrate.
 - **Safe by design:** it only *reads* the log, only acts on genuine fault
   states, and never intervenes during calibration.
-- **What it can't auto-fix** (use the tray's manual **Reconnect now**, or
-  recalibrate): a silent stall while still "Tracking", "streaming but no valid
-  gaze", and calibration loss. These can't be detected without subscribing to the
-  gaze stream — which **breaks this hardware** (see FINDINGS §6). Don't do it.
+- **What it can't auto-fix:** the recalibration itself (needs your eyes on the
+  calibration dots — it detects and notifies instead), and the rare "streaming
+  but invalid gaze" freeze, which has no passive signature while the user is
+  away. Detecting that would need a gaze-stream subscription — which **breaks
+  this hardware** (see FINDINGS §6). Don't do it.
 
 ## Compatibility
 
