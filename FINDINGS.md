@@ -702,3 +702,9 @@ so it's redundant with this file.
   re-enumeration can't bring it back, that's a firmware/hardware wedge only a reboot
   clears: the watchdog stops thrashing and raises a distinct **"reboot needed"** tray
   notification instead of a recalibration one.
+- **Gaze-cursor warp self-heals after every recovery, not just full restarts.** A
+  level-1 recovery (runtime-service restart only) fixes a connection drop but breaks
+  the interaction<->engine PTP binding, so gaze comes back while the eyes-move-cursor
+  *warp* stays dead. The post-recovery interaction re-bind now runs after **every**
+  recovery level (it previously ran only at level 2+), so the warp re-binds whenever
+  gaze returns -- no manual "Fix cursor warp" needed.

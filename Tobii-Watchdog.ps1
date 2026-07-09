@@ -33,7 +33,10 @@
     looks identical; the cooldown caps that at one ladder per $StallCooldownMin.
 
     Recovery escalation (auto): 1 = restart runtime service; 2+ = kill+respawn
-    EyeX engine, restart runtime + service. If WaitingForDevice persists with the
+    EyeX engine, restart runtime + service. EVERY level then bounces the interaction
+    process once Tracking returns, so the gaze->cursor warp re-binds (restarting the
+    runtime service alone breaks that binding = gaze works but the cursor warp is
+    dead). If WaitingForDevice persists with the
     tracker HUNG ON USB (descriptor-request-failed / off the bus -- common after a
     hibernate/sleep resume), it re-enumerates the tracker's OWN USB port (safe: only
     its port, and it verifies the device ends ENABLED) -- this recovers a device that
@@ -557,12 +560,14 @@ function Reset-TrackerUsbNode {
 function Invoke-Recovery {
     # AUTO recovery ladder -- no USB power-cycle (kept out of auto on purpose).
     param([int]$Level)
+    $t0 = Get-Date
     if ($Level -le 1) { Restart-RuntimeService }
-    else {
-        $t0 = Get-Date
-        Restart-EyeXEngine; Restart-RuntimeService; Restart-MiddlewareService
-        Invoke-PostRecoveryInteractionReset -Since $t0
-    }
+    else { Restart-EyeXEngine; Restart-RuntimeService; Restart-MiddlewareService }
+    # ANY recovery that restarts the runtime service breaks the interaction<->engine
+    # PTP/warp binding: gaze comes back but the eyes-move-cursor warp stays dead until
+    # the interaction process re-binds. So bounce interaction after EVERY level (not
+    # just 2+), once a fresh Tracking returns, so the warp self-heals too.
+    Invoke-PostRecoveryInteractionReset -Since $t0
 }
 function Invoke-FullReconnect {
     # MANUAL "fix it hard": tracker-port re-enumeration (recovers a descriptor-hung
