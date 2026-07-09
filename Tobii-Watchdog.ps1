@@ -33,9 +33,14 @@
     looks identical; the cooldown caps that at one ladder per $StallCooldownMin.
 
     Recovery escalation (auto): 1 = restart runtime service; 2+ = kill+respawn
-    EyeX engine, restart runtime + service. (No USB power-cycle in auto -- that
-    once left the device DISABLED; it's manual-only via -ForceReconnect and the
-    silent-stall ladder, both of which verify the device ends ENABLED.)
+    EyeX engine, restart runtime + service. If WaitingForDevice persists with the
+    tracker HUNG ON USB (descriptor-request-failed / off the bus -- common after a
+    hibernate/sleep resume), it re-enumerates the tracker's OWN USB port (safe: only
+    its port, and it verifies the device ends ENABLED) -- this recovers a device that
+    plain restarts cannot, with NO reboot. If even that cannot bring it back it raises
+    a REBOOT-needed flag (tray notification) and stops thrashing. (A blanket USB
+    power-cycle stays OUT of auto -- it once left the device DISABLED -- and remains
+    manual-only via -ForceReconnect / the full-reconnect path.)
 
     Modes:  -Once  print state & exit   -ForceReconnect  full reconnect & exit
             -OnWake  resume-from-sleep reconnect if not tracking
@@ -59,6 +64,8 @@ param(
     [int]$BurstSec             = 150,
     [int]$BurstStallCheckSec   = 15,
     [string]$RecalFlag         = 'C:\Scripts\tobii-recal-needed.flag',
+    [string]$RebootNeededFlag  = 'C:\Scripts\tobii-reboot-needed.flag',
+    [int]$UsbHangRebootLevel   = 5,
     [switch]$Once,
     [switch]$ForceReconnect,
     [switch]$OnWake,
@@ -173,6 +180,23 @@ function Clear-RecalNeeded {
     if (Test-Path -LiteralPath $RecalFlag) {
         Write-Log ("Clearing recalibration-needed flag. $Why")
         try { Remove-Item -LiteralPath $RecalFlag -Force -ErrorAction SilentlyContinue } catch { }
+    }
+}
+function Set-RebootNeeded {
+    # Distinct from recal-needed: the tracker fell off the USB bus and even a port
+    # re-enumeration could not bring it back = a firmware/hardware wedge that only a
+    # reboot clears. The tray shows this as a separate "reboot needed" notification.
+    param([string]$Reason)
+    if (-not (Test-Path -LiteralPath $RebootNeededFlag)) {
+        Write-Log ("Raising REBOOT-needed flag: $Reason") 'ERROR'
+        try { Set-Content -LiteralPath $RebootNeededFlag -Value ("{0} {1}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $Reason) } catch { }
+    }
+}
+function Clear-RebootNeeded {
+    param([string]$Why = '')
+    if (Test-Path -LiteralPath $RebootNeededFlag) {
+        Write-Log ("Clearing reboot-needed flag. $Why")
+        try { Remove-Item -LiteralPath $RebootNeededFlag -Force -ErrorAction SilentlyContinue } catch { }
     }
 }
 function Test-StallCleared {
@@ -468,6 +492,68 @@ function Reset-UsbDevice {
         }
     }
 }
+function Test-TrackerUsbHung {
+    # True when the tracker is NOT cleanly on the bus: no VID_2104 node is OK+present.
+    # In this state the engine sits in WaitingForDevice forever and service restarts
+    # are useless -- the fix is to re-enumerate the tracker's USB port. (A normal PRP
+    # drop keeps the device OK/present, so this returns $false there = plain restart.)
+    foreach ($t in @(Get-PnpDevice -ErrorAction SilentlyContinue | Where-Object { $_.InstanceId -match 'VID_2104&PID_030C' })) {
+        $p = (Get-PnpDeviceProperty -InstanceId $t.InstanceId -KeyName 'DEVPKEY_Device_IsPresent' -ErrorAction SilentlyContinue).Data
+        if ($t.Status -eq 'OK' -and $p) { return $false }
+    }
+    return $true
+}
+function Reset-TrackerUsbNode {
+    # SAFE, auto-runnable recovery for a tracker hung mid-enumeration. When the IS5
+    # firmware wedges (e.g. after a hibernate/sleep resume) it can drop its real
+    # identity (VID_2104&PID_030C) and re-appear as a generic "Device Descriptor
+    # Request Failed" node (VID_0000&PID_0002) on the SAME hub port -- so Reset-
+    # UsbDevice (which matches VID_2104) never finds it and the service-restart
+    # ladder thrashes forever. This cycles BOTH the real tracker node(s) AND any
+    # descriptor-failed stand-in ON THE TRACKER'S OWN PORT (the connection locator is
+    # read from the tracker's node at runtime -- never hardcoded), then rescans. It
+    # touches ONLY the tracker's port, never the parent hub or the keyboard, and
+    # verifies the device ends ENABLED -- so it is safe to run automatically (unlike
+    # the blanket USB power-cycle we keep out of auto). Returns $true if a VID_2104
+    # node comes back OK + present. (Verified live 2026-07-09: recovered a device
+    # that was fully off the bus, no reboot.)
+    $pnputil = Join-Path $env:SystemRoot 'System32\pnputil.exe'
+    $trackerNodes = @(Get-PnpDevice -ErrorAction SilentlyContinue | Where-Object { $_.InstanceId -match 'VID_2104&PID_030C' })
+    # the USB connection locator (e.g. '5&1a2b3c&0&9') pins the exact hub port
+    $loc = $null
+    foreach ($t in $trackerNodes) {
+        $seg = ($t.InstanceId -split '\\')[-1]
+        if ($seg -match '&\d+&\d+$') { $loc = $seg; break }
+    }
+    $failed = @()
+    if ($loc) {
+        $failed = @(Get-PnpDevice -ErrorAction SilentlyContinue | Where-Object {
+            $_.InstanceId -match 'VID_0000&PID_0002' -and (($_.InstanceId -split '\\')[-1] -eq $loc) })
+    }
+    $nodes = @(($trackerNodes + $failed) | Sort-Object -Property InstanceId -Unique)
+    if (-not $nodes) { Write-Log 'Tracker USB node not found to port-cycle.' 'WARN'; return $false }
+    foreach ($d in $nodes) {
+        Write-Log ("Re-enumerating tracker port node ($($d.Status)): $($d.InstanceId)")
+        try { Disable-PnpDevice -InstanceId $d.InstanceId -Confirm:$false -ErrorAction SilentlyContinue } catch {}
+        Start-Sleep -Seconds 2
+        try { Enable-PnpDevice -InstanceId $d.InstanceId -Confirm:$false -ErrorAction SilentlyContinue } catch {}
+        Start-Sleep -Seconds 2
+    }
+    try { & $pnputil /scan-devices 2>&1 | Out-Null } catch {}
+    Start-Sleep -Seconds 4
+    # verify + force-enable anything that came back present-but-not-OK (avoid code 22)
+    $ok = $false
+    foreach ($t in @(Get-PnpDevice -ErrorAction SilentlyContinue | Where-Object { $_.InstanceId -match 'VID_2104&PID_030C' })) {
+        $p = (Get-PnpDeviceProperty -InstanceId $t.InstanceId -KeyName 'DEVPKEY_Device_IsPresent' -ErrorAction SilentlyContinue).Data
+        if ($t.Status -eq 'OK' -and $p) { $ok = $true }
+        elseif ($p -and $t.Status -ne 'OK') {
+            try { & $pnputil /enable-device "$($t.InstanceId)" 2>&1 | Out-Null } catch {}
+            try { Enable-PnpDevice -InstanceId $t.InstanceId -Confirm:$false -ErrorAction SilentlyContinue } catch {}
+        }
+    }
+    Write-Log ("Tracker port re-enumeration: " + $(if ($ok) { 'device back OK/present.' } else { 'device still not enumerating.' }))
+    return $ok
+}
 function Invoke-Recovery {
     # AUTO recovery ladder -- no USB power-cycle (kept out of auto on purpose).
     param([int]$Level)
@@ -479,9 +565,11 @@ function Invoke-Recovery {
     }
 }
 function Invoke-FullReconnect {
-    # MANUAL "fix it hard": USB power-cycle (verified) + full stack recycle.
-    Write-Log 'Full reconnect: USB power-cycle + engine + services.'
+    # MANUAL "fix it hard": tracker-port re-enumeration (recovers a descriptor-hung
+    # device that is off the bus) + USB power-cycle + full stack recycle.
+    Write-Log 'Full reconnect: tracker port re-enumeration + USB power-cycle + engine + services.'
     $t0 = Get-Date
+    Reset-TrackerUsbNode | Out-Null
     Reset-UsbDevice
     Restart-EyeXEngine
     Restart-RuntimeService
@@ -629,6 +717,7 @@ while ($true) {
         if (-not $fault) {
             if ($level -gt 0) { Write-Log "Recovered: state is now '$(if($s){$s}else{'unknown'})'." }
             $level = 0; $unhealthySince = $null
+            Clear-RebootNeeded 'tracker healthy again'
 
             # If the recal flag is up and the calibration file has been rewritten
             # since, the user recalibrated -- clear the flag.
@@ -694,7 +783,28 @@ while ($true) {
         Write-Log ("Tracker fault ($fault) -> recovery level $level.") 'WARN'
         # A stack-down fault needs the middleware service (re)started, which only
         # happens at level 2 of the ladder -- level 1 (runtime restart) can't help.
-        if ($stackDown) { Invoke-Recovery -Level 2 } else { Invoke-Recovery -Level $level }
+        if ($stackDown) {
+            Invoke-Recovery -Level 2
+        } elseif ((Test-TrackerUsbHung) -or ($level -ge 3)) {
+            # WaitingForDevice with the tracker NOT cleanly on the bus (descriptor
+            # hang / fell off), or plain restarts have not cleared it. Re-enumerate
+            # the tracker's OWN USB port (safe: only its port, verifies it ends
+            # enabled). If that can't bring it back, it is a true firmware/hardware
+            # wedge that only a reboot clears -- flag it and stop thrashing.
+            if (Test-Path -LiteralPath $RebootNeededFlag) {
+                Write-Log 'Tracker off USB; reboot-needed already flagged -- waiting (no more port cycles).' 'WARN'
+            } else {
+                Write-Log 'WaitingForDevice with tracker hung on USB; re-enumerating its port.' 'WARN'
+                if (Reset-TrackerUsbNode) {
+                    Restart-EyeXEngine; Restart-RuntimeService; Restart-MiddlewareService
+                    Clear-RebootNeeded 'tracker port re-enumerated'
+                } elseif ($level -ge $UsbHangRebootLevel) {
+                    Set-RebootNeeded 'tracker fell off USB and a port re-enumeration could not recover it; a reboot is required'
+                }
+            }
+        } else {
+            Invoke-Recovery -Level $level
+        }
         Start-Sleep -Seconds ($GraceSec + [Math]::Min(($level - 1) * 30, 120))
         $unhealthySince = Get-Date
         $lastLoopMark = Get-Date  # exclude the long recovery from the next clock-gap check

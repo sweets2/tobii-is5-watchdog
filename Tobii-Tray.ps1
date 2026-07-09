@@ -23,6 +23,7 @@ $PauseFlag  = Join-Path $ScriptsDir 'watchdog.pause'
 $Settings   = Join-Path $ScriptsDir 'tray.settings.json'
 $LogPath    = Join-Path $ScriptsDir 'Tobii-Watchdog.log'
 $RecalFlag  = Join-Path $ScriptsDir 'tobii-recal-needed.flag'
+$RebootFlag = Join-Path $ScriptsDir 'tobii-reboot-needed.flag'
 
 $state = @{ mode = 'active'; autoGames = $false }
 if (Test-Path $Settings) {
@@ -108,8 +109,10 @@ function Apply-State {
         if (Test-Path $PauseFlag) { Remove-Item $PauseFlag -Force -ErrorAction SilentlyContinue }
     }
 
-    $recalNeeded = Test-Path $RecalFlag
-    if ($recalNeeded)               { $ni.Icon = $icoRecal;  $txt = 'RECALIBRATION NEEDED' }
+    $rebootNeeded = Test-Path $RebootFlag
+    $recalNeeded  = Test-Path $RecalFlag
+    if ($rebootNeeded)              { $ni.Icon = $icoRecal;  $txt = 'REBOOT NEEDED (tracker off USB)' }
+    elseif ($recalNeeded)           { $ni.Icon = $icoRecal;  $txt = 'RECALIBRATION NEEDED' }
     elseif ($state.mode -eq 'paused') { $ni.Icon = $icoPaused; $txt = 'Paused (manual)' }
     elseif ($gameActive)            { $ni.Icon = $icoGame;   $txt = 'Auto-paused (game)' }
     else                            { $ni.Icon = $icoActive; $txt = 'Active' }
@@ -119,9 +122,22 @@ function Apply-State {
     $miToggle.Text = if ($state.mode -eq 'paused') { 'Resume auto-recovery' } else { 'Pause auto-recovery' }
     $miAuto.Checked = [bool]$state.autoGames
 
-    # The watchdog raises this flag when its whole recovery ladder failed and
-    # the engine still tracks nothing: that is calibration loss (Mode D), which
-    # only human eyes can fix. Nag once on appearance, then every 5 minutes.
+    # Reboot-needed: the watchdog tried everything, incl. re-enumerating the tracker's
+    # USB port, and the device is still off the bus = a firmware/hardware wedge only a
+    # reboot clears. Higher priority than recal. Nag once, then every 5 minutes.
+    if ($rebootNeeded) {
+        if (((Get-Date) - $script:lastRebootNag).TotalMinutes -ge 5) {
+            $script:lastRebootNag = Get-Date
+            $ni.ShowBalloonTip(15000, 'Tobii: reboot needed',
+                'The eye tracker dropped off the USB bus and auto-recovery (including a port re-enumeration) could not bring it back. A reboot is required to restore eye tracking.',
+                [System.Windows.Forms.ToolTipIcon]::Warning)
+        }
+    } else {
+        $script:lastRebootNag = [datetime]::MinValue
+    }
+
+    # The watchdog raises the recal flag when its whole recovery ladder failed and
+    # the engine still tracks nothing: that is calibration loss (Mode D).
     if ($recalNeeded) {
         if (((Get-Date) - $script:lastRecalNag).TotalMinutes -ge 5) {
             $script:lastRecalNag = Get-Date
@@ -260,6 +276,7 @@ $timer.Interval = 3000
 $timer.add_Tick({ Apply-State })   # refresh icon + re-check fullscreen when auto is on
 
 $script:lastRecalNag = [datetime]::MinValue
+$script:lastRebootNag = [datetime]::MinValue
 
 # Instant reaction to power-source and display changes (event-driven, ~0 idle cost).
 # Both funnel into the TobiiWatchdog-OnWake task, which only reconnects if the

@@ -686,3 +686,19 @@ so it's redundant with this file.
   human-visible ground truth that a drop is real; cannot be used as an automated
   signal (sensing the LEDs = opening a device/stream session = the §6 hardware
   reset). Action item: note LED state during a Mode B silent stall.
+- **Tracker can hang mid-USB-enumeration and fall off the bus (auto-recovered, no
+  reboot).** Distinct from both the calibration loss (Mode D) and a normal PRP drop
+  (where the device still reads OK): after a hibernate/sleep resume the IS5 firmware
+  can wedge, drop its real id (`VID_2104&PID_030C`) and re-appear as a generic
+  `VID_0000&PID_0002` **"Device Descriptor Request Failed"** node on the same hub port
+  (`present=False`). Plain service/engine restarts can't help — there is no device to
+  talk to — so the watchdog now **re-enumerates the tracker's own USB port**: it
+  disables+enables *both* the real tracker node and the descriptor-failed stand-in on
+  that port (the connection locator is read at runtime, never hardcoded), then rescans.
+  This recovered a fully-off-the-bus device live with no reboot. It touches only the
+  tracker's port — never the parent hub, which also carries the keyboard — and verifies
+  the device ends enabled, which is why it's safe in the automatic ladder (a *blanket*
+  USB power-cycle stays manual-only; it once left the device disabled). If even a port
+  re-enumeration can't bring it back, that's a firmware/hardware wedge only a reboot
+  clears: the watchdog stops thrashing and raises a distinct **"reboot needed"** tray
+  notification instead of a recalibration one.

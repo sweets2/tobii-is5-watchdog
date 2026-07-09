@@ -64,7 +64,15 @@ Uninstall: `powershell -ExecutionPolicy Bypass -File "C:\Scripts\Uninstall-Tobii
 - **Auto-recovers all *connection-drop* outages** (`WaitingForDevice`) from any
   trigger — sleep, AC/battery change, display change, heavy load, or the random
   PRP bug. Recovery escalates: restart runtime service → recycle the EyeX engine +
-  services → (manual only) USB power-cycle.
+  services → **re-enumerate the tracker's own USB port**. That last step recovers a
+  tracker that hung mid-enumeration and fell *off the USB bus* — common after a
+  hibernate/sleep resume, where it re-appears as a generic "Device Descriptor
+  Request Failed" node — **without a reboot**. It touches only the tracker's own port
+  (never the shared hub/keyboard) and verifies the device ends *enabled*, so it's safe
+  to run automatically. If even a port re-enumeration can't bring the device back, the
+  watchdog stops thrashing and raises a **"reboot needed"** tray notification (a
+  firmware/hardware wedge only a reboot clears). A *blanket* USB power-cycle stays
+  manual-only (`Reconnect now`) — it once left the device disabled.
 - **Auto-recovers a dead stack** — if the Tobii service or engine process is
   missing (crash, or a cold boot after the battery died in sleep), that's a fault
   too, with a post-boot grace so it never fights the service's delayed autostart.
