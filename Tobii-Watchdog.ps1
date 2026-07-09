@@ -55,6 +55,9 @@ param(
     [int]$StallIdleMaxSec      = 60,
     [int]$StallCheckEverySec   = 60,
     [int]$StallCooldownMin     = 45,
+    [int]$ResumeGapSec         = 90,
+    [int]$BurstSec             = 150,
+    [int]$BurstStallCheckSec   = 15,
     [string]$RecalFlag         = 'C:\Scripts\tobii-recal-needed.flag',
     [switch]$Once,
     [switch]$ForceReconnect,
@@ -242,19 +245,40 @@ function Invoke-StallRecovery {
     # re-apply FIRST, and again after each disruptive step (a restart brings the
     # engine back up uncalibrated -- the same Mode-D state -- so it must be followed
     # by a re-apply). Each step is verified by actual engine CPU, not the state line.
-    if ($script:LastStallRecovery -and ((Get-Date) - $script:LastStallRecovery).TotalMinutes -lt $StallCooldownMin) {
-        # Even inside the restart cooldown, a calibration re-apply is free (no restart)
-        # -- try it before resorting to the recalibration flag.
-        Write-Log 'Silent stall within restart cooldown; trying calibration re-apply before flagging.' 'WARN'
+    # -IgnoreCooldown: a fresh wake/boot is a legitimate event (not restart-thrashing),
+    # so the anti-thrash cooldown is skipped for the first post-transition recovery.
+    param([switch]$IgnoreCooldown)
+    $inCooldown = (-not $IgnoreCooldown) -and $script:LastStallRecovery -and (((Get-Date) - $script:LastStallRecovery).TotalMinutes -lt $StallCooldownMin)
+    if ($inCooldown) {
+        # Inside the restart cooldown (anti-thrash). A calibration re-apply is free
+        # (no restart) -- try it first.
+        Write-Log 'Silent stall within restart cooldown; trying calibration re-apply first.' 'WARN'
         if ((Invoke-CalReapply) -and (Test-GazeWorking)) {
             Write-Log 'Stall cleared by calibration re-apply (cooldown path).'
             Clear-RecalNeeded 'calibration re-applied'
             return
         }
-        Set-RecalNeeded 'stall persisted; calibration re-apply did not restore gaze'
+        # Re-apply was not enough. Allow ONE reconnect per cooldown window before
+        # giving up -- a fresh re-stall (e.g. a second hibernate wake soon after the
+        # first) can need the imaging session rebuilt, and flagging for recalibration
+        # without trying that is premature.
+        if (-not $script:CooldownReconnectDone) {
+            $script:CooldownReconnectDone = $true
+            Write-Log 'Re-apply insufficient in cooldown; one reconnect before flagging.' 'WARN'
+            $tc = Get-Date
+            Invoke-Recovery -Level 2
+            if (Wait-ForTracking -TimeoutSec 90 -Since $tc) { Invoke-CalReapply | Out-Null }
+            if (Test-GazeWorking) {
+                Write-Log 'Stall cleared by cooldown reconnect + re-apply.'
+                Clear-RecalNeeded 'engine tracking again'
+                return
+            }
+        }
+        Set-RecalNeeded 'stall persisted; re-apply + one cooldown reconnect did not restore gaze'
         return
     }
     $script:LastStallRecovery = Get-Date
+    $script:CooldownReconnectDone = $false
     Write-Log 'SILENT STALL confirmed: engine claims Tracking at idle CPU while user is active. Starting recovery.' 'ERROR'
 
     # Step 0 -- primary Mode-D fix: re-apply stored calibration (fast, no restart).
@@ -523,7 +547,14 @@ if ($OnWake) {
             if ((Invoke-CalReapply) -and (Test-GazeWorking)) {
                 Clear-RecalNeeded 'calibration re-applied on wake'
             } else {
-                Write-Log 'Resume: re-apply did not restore gaze; leaving it to the stall ladder.' 'WARN'
+                # Harder hibernate wake: the resume also tore down the engine's imaging
+                # session (IR LEDs fully off), so a bare re-apply cannot restore gaze --
+                # it needs a stack reconnect FIRST, then the calibration re-apply. Rather
+                # than wait for the periodic stall check to escalate, run the full
+                # recovery ladder now (restart -> wait Tracking -> re-apply -> full
+                # reconnect -> re-apply) so gaze self-heals on wake instead of staying dead.
+                Write-Log 'Resume: re-apply alone did not restore gaze; escalating to reconnect + re-apply now.' 'WARN'
+                Invoke-StallRecovery
             }
         } else {
             Write-Log ("Resume: state '$s', engine CPU $(if($null -ne $cpu){"${cpu}%"}else{'n/a'}); no action.")
@@ -539,9 +570,17 @@ if (-not $createdNew) { Write-Log 'Another watchdog instance is already running;
 
 # ---- main loop -------------------------------------------------------------
 Rotate-Log
-Write-Log "Tobii watchdog (log-state + stack-presence + silent-stall) started. threshold=${StuckThresholdSec}s poll=${PollSec}s grace=${GraceSec}s bootgrace=${BootGraceSec}s stall<${StallCpuPct}%cpu/${StallCheckEverySec}s cooldown=${StallCooldownMin}m log=$LogPath"
+Write-Log "Tobii watchdog (log-state + stack-presence + silent-stall) started. threshold=${StuckThresholdSec}s poll=${PollSec}s grace=${GraceSec}s bootgrace=${BootGraceSec}s stall<${StallCpuPct}%cpu/${StallCheckEverySec}s cooldown=${StallCooldownMin}m burst=${BurstStallCheckSec}s/${BurstSec}s resumegap=${ResumeGapSec}s log=$LogPath"
 $level = 0; $unhealthySince = $null; $iter = 0; $paused = $false
 $stallStrikes = 0; $lastStallCheck = Get-Date; $script:LastStallRecovery = $null
+$script:CooldownReconnectDone = $false; $script:JustResumed = $false
+# Resume/transition detection: the loop polls every few seconds, so if wall-clock
+# jumps far more than that between iterations, the machine was suspended (sleep or
+# hibernate) or just came up -- detected WITHOUT relying on Windows' flaky resume
+# events. On any such transition (and at startup = post-boot/crash) run an aggressive
+# recheck window so a post-wake Mode-D stall is caught in ~15s, not up to a minute.
+$lastLoopMark = Get-Date
+$burstUntil   = (Get-Date).AddSeconds($BurstSec)
 while ($true) {
     try {
         if ((++$iter % 60) -eq 0) { Rotate-Log }
@@ -549,8 +588,24 @@ while ($true) {
         if (Test-Path $PauseFlag) {
             if (-not $paused) { Write-Log "Paused (tray)."; $paused = $true; $level = 0; $unhealthySince = $null }
             Start-Sleep -Seconds 2
+            $lastLoopMark = Get-Date  # keep clock-gap mark fresh so a long pause is not read as a machine resume
             continue
-        } elseif ($paused) { Write-Log "Resumed (tray)."; $paused = $false }
+        } elseif ($paused) { Write-Log "Resumed (tray)."; $paused = $false; $lastLoopMark = Get-Date }
+
+        # Clock-gap resume detection: a jump much larger than the poll interval means
+        # the box was suspended and just resumed (any of sleep/hibernate/off). Kick off
+        # the aggressive recheck window and force an immediate stall check. $lastLoopMark
+        # is re-stamped after any (long) recovery below so those don't false-trigger it.
+        $nowMark = Get-Date
+        $gap = ($nowMark - $lastLoopMark).TotalSeconds
+        $lastLoopMark = $nowMark
+        if ($gap -gt $ResumeGapSec) {
+            Write-Log ("Resume/transition detected (gap $([int]$gap)s); aggressive recheck for ${BurstSec}s.") 'WARN'
+            $burstUntil = $nowMark.AddSeconds($BurstSec)
+            $lastStallCheck = [DateTime]::MinValue
+            $stallStrikes = 0
+            $script:JustResumed = $true
+        }
 
         $s = Get-TrackerState
         $stackDown = Get-StackDownReason
@@ -587,17 +642,31 @@ while ($true) {
             }
 
             # Periodic silent-stall check (Mode B/D): 'Tracking' can be a lie.
-            # Two positive samples ~a minute apart before acting; never while
-            # the calibration UI is open.
+            # Steady state: two positive samples ~a minute apart before acting.
+            # In the post-transition burst window: check every ${BurstStallCheckSec}s
+            # and act on the FIRST confirmed stall, so a post-wake dead tracker heals
+            # in ~15s instead of up to two minutes. Never while the calibration UI is open.
+            $inBurst      = (Get-Date) -lt $burstUntil
+            $checkEvery   = if ($inBurst) { $BurstStallCheckSec } else { $StallCheckEverySec }
+            $strikesToAct = if ($inBurst) { 1 } else { 2 }
             if ($s -eq 'Tracking' -and -not (Test-ConfigActive) -and
-                ((Get-Date) - $lastStallCheck).TotalSeconds -ge $StallCheckEverySec) {
+                ((Get-Date) - $lastStallCheck).TotalSeconds -ge $checkEvery) {
                 $lastStallCheck = Get-Date
                 if (Test-SilentStall) {
                     $stallStrikes++
-                    if ($stallStrikes -ge 2) {
+                    if ($stallStrikes -ge $strikesToAct) {
                         $stallStrikes = 0
-                        Invoke-StallRecovery
+                        # The first recovery right after a wake bypasses the anti-thrash
+                        # cooldown (a fresh wake is legitimate, not thrashing); later
+                        # recoveries fall back to the normal cooldown + one-reconnect rule.
+                        if ($script:JustResumed) {
+                            $script:JustResumed = $false
+                            Invoke-StallRecovery -IgnoreCooldown
+                        } else {
+                            Invoke-StallRecovery
+                        }
                         $lastStallCheck = Get-Date
+                        $lastLoopMark = Get-Date
                     }
                 } else {
                     $stallStrikes = 0
@@ -628,6 +697,7 @@ while ($true) {
         if ($stackDown) { Invoke-Recovery -Level 2 } else { Invoke-Recovery -Level $level }
         Start-Sleep -Seconds ($GraceSec + [Math]::Min(($level - 1) * 30, 120))
         $unhealthySince = Get-Date
+        $lastLoopMark = Get-Date  # exclude the long recovery from the next clock-gap check
     } catch {
         Write-Log "Loop error: $($_.Exception.Message)" 'ERROR'
         Start-Sleep -Seconds $PollSec
