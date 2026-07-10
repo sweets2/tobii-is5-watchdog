@@ -708,3 +708,24 @@ so it's redundant with this file.
   *warp* stays dead. The post-recovery interaction re-bind now runs after **every**
   recovery level (it previously ran only at level 2+), so the warp re-binds whenever
   gaze returns -- no manual "Fix cursor warp" needed.
+- **A descriptor-hung tracker cannot be revived by ANY software path — only power
+  removal.** Second hard wedge in two days proved this exhaustively. The drop happened
+  while the machine was *awake* under heavy CPU load (no sleep/resume involved), so the
+  enumeration-hang is not a resume-only failure. With the device off the bus
+  (`present=False`, descriptor-request-failed), an elevated escalation ladder was run:
+  removing all stale devnodes + rescan (the port then enumerates *nothing* — the device
+  is electrically mute), restarting the parent root hub, disable/enable of the hub,
+  restarting the xHCI host controller, disable/enable of the controller, and finally
+  `pnputil /remove-device /subtree` on the controller itself. Every hub/controller
+  operation was vetoed online ("system reboot is needed") because in-use children
+  prevent releasing the hub, and the first deferred operation poisons all later ones
+  on that node. Conclusion: once the watchdog's own port re-enumeration fails, the
+  firmware is wedged below anything software can reach; the reboot-needed flag is the
+  correct terminal state, and a full shutdown (power removal — not a warm restart) is
+  the only fix. Gotchas for anyone attempting this: PowerShell's `Disable-PnpDevice`
+  (CIM) returns "Not supported" for root hubs and host controllers — use
+  `pnputil /disable-device | /enable-device | /restart-device` instead; and
+  `pnputil /scan-devices` requires elevation, so verify results from a log rather than
+  assuming silenced cmdlets ran. Also confirmed: `nhi` (Thunderbolt host-interface)
+  errors that appear during rescans are a red herring — the idle TB controller waking
+  into RTD3 when the scan pokes all buses, unrelated to the tracker's fabric.
