@@ -68,6 +68,7 @@ param(
     [int]$BurstStallCheckSec   = 15,
     [string]$RecalFlag         = 'C:\Scripts\tobii-recal-needed.flag',
     [string]$RebootNeededFlag  = 'C:\Scripts\tobii-reboot-needed.flag',
+    [string]$RecoveringFlag    = 'C:\Scripts\tobii-recovering.flag',
     [int]$UsbHangRebootLevel   = 5,
     [switch]$Once,
     [switch]$ForceReconnect,
@@ -207,6 +208,19 @@ function Clear-RebootNeeded {
         try { Remove-Item -LiteralPath $RebootNeededFlag -Force -ErrorAction SilentlyContinue } catch { }
     }
 }
+function Set-Recovering {
+    # Visibility flag for the tray: a fault was detected and the recovery ladder is
+    # running. The tray shows 'auto-recovering' + a balloon so the user KNOWS the
+    # watchdog caught it (an outage with no feedback looks identical to a dead watchdog).
+    if (-not (Test-Path -LiteralPath $RecoveringFlag)) {
+        try { Set-Content -LiteralPath $RecoveringFlag -Value (Get-Date -Format 'yyyy-MM-dd HH:mm:ss') } catch { }
+    }
+}
+function Clear-Recovering {
+    if (Test-Path -LiteralPath $RecoveringFlag) {
+        try { Remove-Item -LiteralPath $RecoveringFlag -Force -ErrorAction SilentlyContinue } catch { }
+    }
+}
 function Test-StallCleared {
     # After a recovery step: wait for a fresh Tracking, then confirm the engine
     # is actually working (CPU at tracking level while the user is present).
@@ -311,6 +325,7 @@ function Invoke-StallRecovery {
     }
     $script:LastStallRecovery = Get-Date
     $script:CooldownReconnectDone = $false
+    Set-Recovering
     Write-Log 'SILENT STALL confirmed: engine claims Tracking at idle CPU while user is active. Starting recovery.' 'ERROR'
 
     # Step 0 -- primary Mode-D fix: re-apply stored calibration (fast, no restart).
@@ -677,6 +692,7 @@ $stallStrikes = 0; $lastStallCheck = Get-Date; $script:LastStallRecovery = $null
 $script:CooldownReconnectDone = $false; $script:JustResumed = $false
 $script:WasLocked = [bool](Get-Process -Name 'LogonUI' -ErrorAction SilentlyContinue)
 $script:StallDegradationCount = 0
+Clear-Recovering   # never start with a stale recovering flag from a previous run
 # Resume/transition detection: the loop polls every few seconds, so if wall-clock
 # jumps far more than that between iterations, the machine was suspended (sleep or
 # hibernate) or just came up -- detected WITHOUT relying on Windows' flaky resume
@@ -769,6 +785,7 @@ while ($true) {
             if ($level -gt 0) { Write-Log "Recovered: state is now '$(if($s){$s}else{'unknown'})'." }
             $level = 0; $unhealthySince = $null
             Clear-RebootNeeded 'tracker healthy again'
+            Clear-Recovering
 
             # If the recal flag is up and the calibration file has been rewritten
             # since, the user recalibrated -- clear the flag.
@@ -832,6 +849,7 @@ while ($true) {
 
         $level++
         Write-Log ("Tracker fault ($fault) -> recovery level $level.") 'WARN'
+        Set-Recovering
         # A stack-down fault needs the middleware service (re)started, which only
         # happens at level 2 of the ladder -- level 1 (runtime restart) can't help.
         if ($stackDown) {

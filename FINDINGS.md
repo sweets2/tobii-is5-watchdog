@@ -778,3 +778,14 @@ so it's redundant with this file.
   shutdown previously believed necessary. The tray's terminal notification now says
   SLEEP/WAKE instead of REBOOT. Survey/cycle tool: `CyclePort.ps1` (hub instance ID
   inside is machine-specific — adjust for your hub).
+- **Recovery must be visible, or it looks like failure.** A routine drop was caught
+  and fixed by the ladder in ~3.5 minutes with zero intervention — but the user
+  couldn't tell the watchdog was on it (dark IR LEDs during recovery look identical
+  to a dead watchdog) and escalated manually. Fix: the watchdog now writes a
+  `recovering` flag while its ladder runs (cleared on health, on startup, and by the
+  uninstaller), and the tray shows an orange icon + one balloon per episode: "drop
+  caught - auto-recovering, typically back in 1-4 min, no action needed." Tray UX
+  also reworked: LEFT-click now opens the same menu as right-click instead of
+  silently toggling pause (the silent-pause landmine, hit twice), Pause/Resume is
+  the top menu item, and the palette is green=active, orange=recovering,
+  yellow=paused (manual or game), red=failure (recalibration / sleep-wake needed).

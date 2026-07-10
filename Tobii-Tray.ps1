@@ -1,7 +1,11 @@
 <#
     Tobii-Tray.ps1  - system-tray control for the Tobii watchdog.
-    Left-click the tray icon = Pause/Resume.  Right-click = menu.
-    Icon: green = active, gray = paused (manual), orange = auto-paused (game).
+    LEFT-click OR RIGHT-click = menu (Pause/Resume is the top item; a bare
+    left-click used to toggle pause, which twice caused a silent multi-hour
+    pause -- so clicks never change state anymore).
+    Icon: green = active, orange = auto-recovering (drop caught, ladder running),
+    yellow = paused (manual or fullscreen game), red = FAILURE (recalibration or
+    sleep/wake needed).
 
     It controls the watchdog purely by creating/removing a flag file
     (C:\Scripts\watchdog.pause). No admin needed. Settings persist to
@@ -24,6 +28,7 @@ $Settings   = Join-Path $ScriptsDir 'tray.settings.json'
 $LogPath    = Join-Path $ScriptsDir 'Tobii-Watchdog.log'
 $RecalFlag  = Join-Path $ScriptsDir 'tobii-recal-needed.flag'
 $RebootFlag = Join-Path $ScriptsDir 'tobii-reboot-needed.flag'
+$RecoveringFlag = Join-Path $ScriptsDir 'tobii-recovering.flag'
 
 $state = @{ mode = 'active'; autoGames = $false }
 if (Test-Path $Settings) {
@@ -55,10 +60,11 @@ function New-DotIcon($color) {
     $bmp.Dispose()
     return $ico
 }
-$icoActive = New-DotIcon ([System.Drawing.Color]::LimeGreen)
-$icoPaused = New-DotIcon ([System.Drawing.Color]::Gray)
-$icoGame   = New-DotIcon ([System.Drawing.Color]::Orange)
-$icoRecal  = New-DotIcon ([System.Drawing.Color]::Red)
+$icoActive     = New-DotIcon ([System.Drawing.Color]::LimeGreen)
+$icoPaused     = New-DotIcon ([System.Drawing.Color]::Gold)      # yellow = paused
+$icoGame       = New-DotIcon ([System.Drawing.Color]::Gold)      # game pause is a pause
+$icoRecal      = New-DotIcon ([System.Drawing.Color]::Red)       # red = failure
+$icoRecovering = New-DotIcon ([System.Drawing.Color]::Orange)    # orange = fixing it now
 
 $ni   = New-Object System.Windows.Forms.NotifyIcon
 $menu = New-Object System.Windows.Forms.ContextMenuStrip
@@ -82,6 +88,7 @@ $miExit   = New-Object System.Windows.Forms.ToolStripMenuItem "Exit tray (watchd
 $sep1 = New-Object System.Windows.Forms.ToolStripSeparator
 $sep2 = New-Object System.Windows.Forms.ToolStripSeparator
 $sep3 = New-Object System.Windows.Forms.ToolStripSeparator
+[void]$menu.Items.Add($miToggle)      # pause/resume for the whole watchdog - top item
 [void]$menu.Items.Add($miStatus)
 [void]$menu.Items.Add($sep1)
 [void]$menu.Items.Add($miReconnect)
@@ -89,7 +96,6 @@ $sep3 = New-Object System.Windows.Forms.ToolStripSeparator
 [void]$menu.Items.Add($miReapply)
 [void]$menu.Items.Add($miRecal)
 [void]$menu.Items.Add($sep2)
-[void]$menu.Items.Add($miToggle)
 [void]$menu.Items.Add($miAuto)
 [void]$menu.Items.Add($sep3)
 [void]$menu.Items.Add($miDrops)
@@ -111,11 +117,26 @@ function Apply-State {
 
     $rebootNeeded = Test-Path $RebootFlag
     $recalNeeded  = Test-Path $RecalFlag
+    $recovering   = Test-Path $RecoveringFlag
     if ($rebootNeeded)              { $ni.Icon = $icoRecal;  $txt = 'SLEEP/WAKE NEEDED (tracker off USB)' }
     elseif ($recalNeeded)           { $ni.Icon = $icoRecal;  $txt = 'RECALIBRATION NEEDED' }
+    elseif ($recovering)            { $ni.Icon = $icoRecovering; $txt = 'Auto-recovering (drop caught, fixing now)' }
     elseif ($state.mode -eq 'paused') { $ni.Icon = $icoPaused; $txt = 'Paused (manual)' }
     elseif ($gameActive)            { $ni.Icon = $icoGame;   $txt = 'Auto-paused (game)' }
     else                            { $ni.Icon = $icoActive; $txt = 'Active' }
+
+    # One balloon per recovery episode so the user KNOWS the watchdog caught the
+    # drop and is working on it (no feedback looks identical to a dead watchdog).
+    if ($recovering -and -not $rebootNeeded -and -not $recalNeeded) {
+        if (-not $script:wasRecovering) {
+            $script:wasRecovering = $true
+            $ni.ShowBalloonTip(8000, 'Tobii: drop caught - auto-recovering',
+                'The eye tracker dropped and the watchdog is already fixing it. Typically back in 1-4 minutes. No action needed.',
+                [System.Windows.Forms.ToolTipIcon]::Info)
+        }
+    } else {
+        $script:wasRecovering = $false
+    }
 
     $ni.Text       = "Tobii Watchdog: $txt"
     $miStatus.Text = "Status: $txt"
@@ -270,7 +291,15 @@ $miStats.add_Click({
 $miLog.add_Click({ if (Test-Path $LogPath) { Start-Process notepad.exe $LogPath } })
 $miTelem.add_Click({ Start-Process explorer.exe 'C:\Scripts' })
 $miExit.add_Click({ $ni.Visible = $false; $ni.Dispose(); [System.Windows.Forms.Application]::Exit() })
-$ni.add_MouseClick({ param($s,$e) if ($e.Button -eq [System.Windows.Forms.MouseButtons]::Left) { Toggle-Pause } })
+# Left-click opens the SAME menu as right-click (a bare left-click used to toggle
+# pause, which twice left the watchdog silently paused for hours). ShowContextMenu
+# is non-public on NotifyIcon, so invoke it via reflection.
+$ni.add_MouseUp({ param($s,$e)
+    if ($e.Button -eq [System.Windows.Forms.MouseButtons]::Left) {
+        $mi = [System.Windows.Forms.NotifyIcon].GetMethod('ShowContextMenu', [System.Reflection.BindingFlags]'Instance,NonPublic')
+        if ($mi) { $mi.Invoke($ni, $null) }
+    }
+})
 
 $timer = New-Object System.Windows.Forms.Timer
 $timer.Interval = 3000
@@ -278,6 +307,7 @@ $timer.add_Tick({ Apply-State })   # refresh icon + re-check fullscreen when aut
 
 $script:lastRecalNag = [datetime]::MinValue
 $script:lastRebootNag = [datetime]::MinValue
+$script:wasRecovering = $false
 
 # Instant reaction to power-source and display changes (event-driven, ~0 idle cost).
 # Both funnel into the TobiiWatchdog-OnWake task, which only reconnects if the
