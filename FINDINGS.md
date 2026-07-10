@@ -744,3 +744,18 @@ so it's redundant with this file.
   burst window as a resume (fast checks, act on first strike). While locked it adds
   nothing — the engine legitimately idles there, and the stall detector already
   requires user activity before acting.
+- **Preventive at-lock reconnect — catching the wedge before it happens.** The hard
+  wedge gave a full hour of warning: repeated silent-stall samples (engine at ~0% CPU
+  while the user was active) below the action threshold. Acting mid-use would disrupt
+  the user, but the moment the session *locks* is the perfect intervention point — the
+  user is away, and the next danger is precisely the unlock reactivation. So every
+  degradation sample now increments a counter that only a full reconnect (a genuine
+  clean re-enumeration — not a mere calibration re-apply) clears; on the
+  unlocked→locked edge, if two or more samples have accumulated, the watchdog runs a
+  full reconnect + calibration re-apply right then. The device rides out the lock
+  freshly enumerated instead of idling in a fragile state, and unlock starts clean.
+  Healthy devices are left alone, so there is no churn; the preventive pass is skipped
+  when the tracker is already off the bus (the fault ladder owns that), the stack is
+  down, or a reboot is pending. Caveat if you use Windows Hello face login: the
+  reconnect makes the camera briefly unavailable at the start of a lock — check
+  `WbioSrvc` before enabling this pattern on a Hello machine.

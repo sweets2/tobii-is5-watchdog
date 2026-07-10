@@ -165,6 +165,11 @@ function Test-SilentStall {
     # user must still have been around during the sample window
     if ((Get-ConsoleIdleSec) -gt ($StallIdleMaxSec + 15)) { return $false }
     Write-Log ("Silent-stall sample: state=Tracking, engine CPU ${cpu}%, user active.") 'WARN'
+    # Degradation bookkeeping: single samples (below the 2-consecutive-strikes action
+    # threshold) still mark the device as degraded since its last clean re-enumeration.
+    # The 07-10 hard wedge was preceded by an HOUR of such samples; they arm the
+    # preventive at-lock reconnect (see main loop).
+    $script:StallDegradationCount++
     return $true
 }
 function Get-CalibrationFile {
@@ -580,6 +585,9 @@ function Invoke-FullReconnect {
     Restart-RuntimeService
     Restart-MiddlewareService
     Invoke-PostRecoveryInteractionReset -Since $t0
+    # A full reconnect IS a clean re-enumeration: clear the degradation counter that
+    # arms the preventive at-lock reconnect.
+    $script:StallDegradationCount = 0
 }
 function Invoke-PostRecoveryInteractionReset {
     # After a full-stack restart the service respawns the interaction process
@@ -668,6 +676,7 @@ $level = 0; $unhealthySince = $null; $iter = 0; $paused = $false
 $stallStrikes = 0; $lastStallCheck = Get-Date; $script:LastStallRecovery = $null
 $script:CooldownReconnectDone = $false; $script:JustResumed = $false
 $script:WasLocked = [bool](Get-Process -Name 'LogonUI' -ErrorAction SilentlyContinue)
+$script:StallDegradationCount = 0
 # Resume/transition detection: the loop polls every few seconds, so if wall-clock
 # jumps far more than that between iterations, the machine was suspended (sleep or
 # hibernate) or just came up -- detected WITHOUT relying on Windows' flaky resume
@@ -715,6 +724,25 @@ while ($true) {
             $lastStallCheck = [DateTime]::MinValue
             $stallStrikes = 0
             $script:JustResumed = $true
+        } elseif ($lockedNow -and -not $script:WasLocked) {
+            # PREVENTIVE maintenance on the unlocked->locked edge. The 07-10 hard wedge
+            # was armed by an hour of degradation samples and fired when the runtime's
+            # idle->reactivate transition hit the sick device at unlock. A device that
+            # showed degradation gets a full CLEAN reconnect now, while the user is
+            # away (zero disruption): it then sits freshly re-enumerated through the
+            # lock instead of idling in a fragile state. Healthy devices are left
+            # alone -- no churn. Skipped when the tracker is already off the bus
+            # (fault ladder owns that) or a reboot is pending.
+            if (($script:StallDegradationCount -ge 2) -and
+                -not (Test-Path -LiteralPath $RebootNeededFlag) -and
+                -not (Get-StackDownReason) -and
+                -not (Test-TrackerUsbHung)) {
+                Write-Log ("Session lock with $($script:StallDegradationCount) degradation samples since last clean reset; preventive full reconnect while user is away.") 'WARN'
+                $tL = Get-Date
+                Invoke-FullReconnect
+                if (Wait-ForTracking -TimeoutSec 90 -Since $tL) { Invoke-CalReapply | Out-Null }
+                $lastLoopMark = Get-Date  # long op; do not false-trigger the resume-gap check
+            }
         }
         $script:WasLocked = $lockedNow
 
