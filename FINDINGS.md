@@ -789,3 +789,18 @@ so it's redundant with this file.
   silently toggling pause (the silent-pause landmine, hit twice), Pause/Resume is
   the top menu item, and the palette is green=active, orange=recovering,
   yellow=paused (manual or game), red=failure (recalibration / sleep-wake needed).
+- **Recovery latency audit: the "4-minute outage" was conservatism, not blindness —
+  and 100+ seconds of it was cuttable.** Breakdown of a level-2 outage: ~38s
+  detect/confirm (fine), 1s level-1 restart, **90s** waiting out the full
+  verify-timeout while the engine sat parked in a fresh WaitingForDevice (useless —
+  the device was never coming back at that level), 45s anti-thrash grace, **30s**
+  re-confirming a fault that had never cleared, then ~95s for the level-2 stack
+  restart + engine boot (the hard floor — the engine takes ~90s to reach Tracking).
+  Fixes: (1) Wait-ForTracking now FAILS FAST when the restarted engine parks in a
+  fresh WaitingForDevice for 15s continuously (after a 20s settle) — escalation
+  starts ~60s sooner; (2) between ladder rungs the fault re-confirmation drops from
+  the full threshold to 10s (it was already continuously confirmed); (3) detection
+  threshold 30s -> 20s and inter-rung grace 45s -> 25s. Net: a level-1 drop heals
+  in ~1.5-2 min (engine boot dominates, unchangeable) and a level-2 drop in ~3 min
+  instead of ~4.5. The engine's own ~90s boot-to-Tracking is the floor no watchdog
+  can cut.

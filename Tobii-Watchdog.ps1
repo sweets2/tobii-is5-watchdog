@@ -51,9 +51,9 @@
 #>
 [CmdletBinding()]
 param(
-    [int]$StuckThresholdSec = 30,
+    [int]$StuckThresholdSec = 20,
     [int]$PollSec          = 5,
-    [int]$GraceSec         = 45,
+    [int]$GraceSec         = 25,
     [int]$BootGraceSec     = 240,
     [string]$LogPath       = 'C:\Scripts\Tobii-Watchdog.log',
     [int]$MaxLogBytes      = 1048576,
@@ -485,12 +485,27 @@ function Restart-InteractionProcess {
 function Wait-ForTracking {
     # Waits until the engine reports a FRESH 'Tracking' (state line written after
     # $Since), so a stale pre-restart line can't satisfy it.
+    # FAIL-FAST: if the restarted engine parks in a FRESH 'WaitingForDevice' for
+    # 15s+ (after a 20s settle), the device is not coming back at this ladder level;
+    # sitting out the full timeout only delays escalation (this alone cost ~75s of
+    # the 17:24 level-2 outage). Transient WaitingForDevice during engine startup
+    # is tolerated by the 15s-continuous requirement.
     param([int]$TimeoutSec = 90, [datetime]$Since = (Get-Date))
     $t0 = Get-Date
+    $wfdSince = $null
     while (((Get-Date) - $t0).TotalSeconds -lt $TimeoutSec) {
         if (-not (Get-StackDownReason)) {
             $s = Get-TrackerStateStamped
-            if ($s -and $s.State -eq 'Tracking' -and $s.Time -and $s.Time -gt $Since) { return $true }
+            if ($s -and $s.Time -and $s.Time -gt $Since) {
+                if ($s.State -eq 'Tracking') { return $true }
+                if ($s.State -eq 'WaitingForDevice') {
+                    if ($null -eq $wfdSince) { $wfdSince = Get-Date }
+                    elseif ((((Get-Date) - $wfdSince).TotalSeconds -ge 15) -and (((Get-Date) - $t0).TotalSeconds -ge 20)) {
+                        Write-Log 'Engine restarted but parked in WaitingForDevice; failing fast to escalate.' 'WARN'
+                        return $false
+                    }
+                } else { $wfdSince = $null }
+            }
         }
         Start-Sleep -Seconds 3
     }
@@ -842,7 +857,11 @@ while ($true) {
         }
 
         if ($null -eq $unhealthySince) { $unhealthySince = Get-Date }
-        if (((Get-Date) - $unhealthySince).TotalSeconds -lt $StuckThresholdSec) {
+        # During an active recovery episode (level > 0) the fault has already been
+        # continuously confirmed; re-confirming for the full threshold between ladder
+        # rungs just delays escalation. 10s is enough to debounce between rungs.
+        $effThreshold = if ($level -gt 0) { 10 } else { $StuckThresholdSec }
+        if (((Get-Date) - $unhealthySince).TotalSeconds -lt $effThreshold) {
             Start-Sleep -Seconds $PollSec
             continue
         }
