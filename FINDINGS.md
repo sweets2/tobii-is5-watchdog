@@ -804,3 +804,9 @@ so it's redundant with this file.
   in ~1.5-2 min (engine boot dominates, unchangeable) and a level-2 drop in ~3 min
   instead of ~4.5. The engine's own ~90s boot-to-Tracking is the floor no watchdog
   can cut.
+- **Sleep stays manual, always.** The watchdog never suspends the machine itself
+  (zero suspend calls in it — verified); a surprise sleep would be worse than a dead
+  tracker. When the power-wedge state is detected the tray turns ORANGE ("needs
+  sleep") and points at the one-click SleepWake button; blue now means
+  auto-recovering. Final palette: green = active, blue = recovering, orange = needs
+  a manual sleep, yellow = paused, red = recalibration needed.

@@ -3,9 +3,11 @@
     LEFT-click OR RIGHT-click = menu (Pause/Resume is the top item; a bare
     left-click used to toggle pause, which twice caused a silent multi-hour
     pause -- so clicks never change state anymore).
-    Icon: green = active, orange = auto-recovering (drop caught, ladder running),
-    yellow = paused (manual or fullscreen game), red = FAILURE (recalibration or
-    sleep/wake needed).
+    Icon: green = active, blue = auto-recovering (drop caught, ladder running),
+    ORANGE = NEEDS SLEEP (tracker power-wedged; put the PC to sleep manually or
+    use the SleepWake Tracker button -- the watchdog NEVER sleeps the machine
+    itself), yellow = paused (manual or fullscreen game), red = FAILURE
+    (recalibration needed).
 
     It controls the watchdog purely by creating/removing a flag file
     (C:\Scripts\watchdog.pause). No admin needed. Settings persist to
@@ -61,10 +63,11 @@ function New-DotIcon($color) {
     return $ico
 }
 $icoActive     = New-DotIcon ([System.Drawing.Color]::LimeGreen)
-$icoPaused     = New-DotIcon ([System.Drawing.Color]::Gold)      # yellow = paused
-$icoGame       = New-DotIcon ([System.Drawing.Color]::Gold)      # game pause is a pause
-$icoRecal      = New-DotIcon ([System.Drawing.Color]::Red)       # red = failure
-$icoRecovering = New-DotIcon ([System.Drawing.Color]::Orange)    # orange = fixing it now
+$icoPaused     = New-DotIcon ([System.Drawing.Color]::Gold)       # yellow = paused
+$icoGame       = New-DotIcon ([System.Drawing.Color]::Gold)       # game pause is a pause
+$icoRecal      = New-DotIcon ([System.Drawing.Color]::Red)        # red = failure
+$icoRecovering = New-DotIcon ([System.Drawing.Color]::DodgerBlue) # blue = fixing it now
+$icoSleep      = New-DotIcon ([System.Drawing.Color]::Orange)     # orange = NEEDS SLEEP (manual)
 
 $ni   = New-Object System.Windows.Forms.NotifyIcon
 $menu = New-Object System.Windows.Forms.ContextMenuStrip
@@ -118,7 +121,7 @@ function Apply-State {
     $rebootNeeded = Test-Path $RebootFlag
     $recalNeeded  = Test-Path $RecalFlag
     $recovering   = Test-Path $RecoveringFlag
-    if ($rebootNeeded)              { $ni.Icon = $icoRecal;  $txt = 'SLEEP/WAKE NEEDED (tracker off USB)' }
+    if ($rebootNeeded)              { $ni.Icon = $icoSleep;  $txt = 'NEEDS SLEEP - run SleepWake Tracker (tracker off USB)' }
     elseif ($recalNeeded)           { $ni.Icon = $icoRecal;  $txt = 'RECALIBRATION NEEDED' }
     elseif ($recovering)            { $ni.Icon = $icoRecovering; $txt = 'Auto-recovering (drop caught, fixing now)' }
     elseif ($state.mode -eq 'paused') { $ni.Icon = $icoPaused; $txt = 'Paused (manual)' }
@@ -150,8 +153,8 @@ function Apply-State {
     if ($rebootNeeded) {
         if (((Get-Date) - $script:lastRebootNag).TotalMinutes -ge 5) {
             $script:lastRebootNag = Get-Date
-            $ni.ShowBalloonTip(15000, 'Tobii: sleep/wake needed',
-                'The eye tracker dropped off the USB bus and auto-recovery could not bring it back. FIX: put the PC to SLEEP for ~10s, then wake it - sleep cuts the tracker power rail and reboots its firmware (proven 2026-07-10). Full shutdown also works.',
+            $ni.ShowBalloonTip(15000, 'Tobii: needs sleep (manual)',
+                'The eye tracker is power-wedged and auto-recovery cannot reach it. Put the PC to sleep yourself: double-click the SleepWake Tracker button on the Desktop (sleeps ~40s and wakes itself), or sleep manually. The watchdog never sleeps the machine on its own.',
                 [System.Windows.Forms.ToolTipIcon]::Warning)
         }
     } else {
