@@ -18,7 +18,7 @@ echo.
 if /I not "%~dp0"=="C:\Scripts\" (
     if not exist "C:\Scripts" mkdir "C:\Scripts"
     echo Copying files to C:\Scripts ...
-    for %%F in (Tobii-Watchdog.ps1 Tobii-Monitor.ps1 Tobii-Tray.ps1 Tobii-Tray.vbs Install-TobiiWatchdog.ps1 Uninstall-TobiiWatchdog.ps1 FINDINGS.md) do (
+    for %%F in (Tobii-Watchdog.ps1 Tobii-Monitor.ps1 Tobii-Sentinel.ps1 Tobii-Tray.ps1 Tobii-Tray.vbs Tobii-CalReapply.cs CyclePort.ps1 Install-TobiiWatchdog.ps1 Uninstall-TobiiWatchdog.ps1 README.md FINDINGS.md) do (
         if exist "%~dp0%%F" copy /Y "%~dp0%%F" "C:\Scripts\%%F" >nul
     )
 )

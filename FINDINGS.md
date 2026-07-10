@@ -810,3 +810,21 @@ so it's redundant with this file.
   sleep") and points at the one-click SleepWake button; blue now means
   auto-recovering. Final palette: green = active, blue = recovering, orange = needs
   a manual sleep, yellow = paused, red = recalibration needed.
+- **2026-07-10 — robustness V2: serialized, bounded, self-supervised recovery.**
+  A Codex adversarial review found several availability bugs in the watchdog itself:
+  one-shot wake/manual tasks ran before the main mutex and could overlap the main
+  recovery; a full reconnect performed two consecutive USB disruptions; 1.5% CPU
+  accepted the observed 4.1% frozen state; idle-user verification was incorrectly
+  treated as success; and the manual-sleep flag could clear without positive health
+  proof. The V2 design adds one cross-process recovery coordinator, deterministic
+  service teardown/start ordering, one USB re-enumeration per full reconnect,
+  tri-state verification (healthy/unhealthy/unknown), a learned 4.5-6% degradation
+  threshold with a conservative quiet-user path, typed terminal outcomes
+  (recalibration vs. manual sleep), and a bounded terminal state instead of recovery
+  levels climbing forever. `Tobii-Sentinel.ps1` supervises watchdog/monitor
+  heartbeats without touching the device. The tray reports recovery phase, turns
+  gray when the watchdog is offline, and offers an explicitly confirmed manual
+  sleep/wake action. Telemetry is now PID-aware (fixes negative CPU after process
+  replacement), records recovery phase/fault type, and excludes monitor gaps from
+  hourly rates. The hard constraint remains: no gaze subscription and no automatic
+  sleep or reboot.

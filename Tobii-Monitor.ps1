@@ -22,15 +22,18 @@ param(
     [int]$MaxTelemetryBytes = 5242880,          # 5 MB rotation
     [string]$SnapshotDir  = 'C:\Scripts\Tobii-Diagnostics\snapshots',
     [string]$PauseFlag    = 'C:\Scripts\watchdog.pause',
+    [string]$HeartbeatFile = 'C:\Scripts\tobii-monitor.heartbeat.json',
+    [string]$RecoveryStateFile = 'C:\Scripts\tobii-recovery-state.json',
     [switch]$Stats,
     [switch]$Once
 )
 $ErrorActionPreference = 'Continue'
+$MonitorStartedAt = Get-Date
 $ServerLogPath = Join-Path $env:LOCALAPPDATA 'Tobii\Tobii Interaction\ServerLog.txt'
 $HealthyStates = @('Tracking','Idle')
 # Auto-detect the Tobii IS5 USB node (VID 2104 = Tobii). Works on any m17 R2 /
 # IS5 unit -- no hardcoded per-device serial.
-$DeviceInstId  = (Get-PnpDevice -ErrorAction SilentlyContinue |
+$script:DeviceInstId  = (Get-PnpDevice -ErrorAction SilentlyContinue |
     Where-Object { $_.InstanceId -match 'VID_2104&PID_030C' -and $_.Class -eq 'USBDevice' } |
     Select-Object -First 1).InstanceId
 
@@ -51,7 +54,7 @@ public static class TobiiNative {
 Add-Type -AssemblyName System.Windows.Forms -ErrorAction SilentlyContinue
 
 # ---- sampling --------------------------------------------------------------
-$script:prevCpu = @{}   # procName -> [TimeSpan] last TotalProcessorTime
+$script:prevCpu = @{}   # procName -> @{ pid; total }; PID-aware to avoid negative deltas
 $script:prevAt  = $null
 
 function Get-EngineState {
@@ -67,18 +70,30 @@ function Get-CpuPct([string]$name) {
     $p = Get-Process -Name $name -ErrorAction SilentlyContinue | Select-Object -First 1
     if (-not $p) { $script:prevCpu.Remove($name); return @{ present=$false; cpu=$null; mem=$null; pid=$null } }
     $now = $p.TotalProcessorTime; $mem = [math]::Round($p.WorkingSet64/1MB,1); $cpu = $null
-    if ($script:prevCpu.ContainsKey($name) -and $script:prevAt) {
+    $previous = if ($script:prevCpu.ContainsKey($name)) { $script:prevCpu[$name] } else { $null }
+    if ($previous -and $previous.pid -eq $p.Id -and $script:prevAt) {
         $secs = ((Get-Date) - $script:prevAt).TotalSeconds
-        if ($secs -gt 0) { $cpu = [math]::Round(100*($now - $script:prevCpu[$name]).TotalSeconds/$secs, 1) }
+        if ($secs -gt 0) { $cpu = [math]::Round(100*($now - $previous.total).TotalSeconds/$secs, 1) }
     }
-    $script:prevCpu[$name] = $now
+    $script:prevCpu[$name] = @{ pid=$p.Id; total=$now }
     return @{ present=$true; cpu=$cpu; mem=$mem; pid=$p.Id }
 }
 function Get-Sample {
     $es = Get-EngineState
-    $dev = Get-PnpDevice -InstanceId $DeviceInstId -ErrorAction SilentlyContinue
+    if (-not $script:DeviceInstId) {
+        $script:DeviceInstId = (Get-PnpDevice -ErrorAction SilentlyContinue |
+            Where-Object { $_.InstanceId -match 'VID_2104&PID_030C' -and $_.Class -eq 'USBDevice' } |
+            Select-Object -First 1).InstanceId
+    }
+    $dev = if ($script:DeviceInstId) { Get-PnpDevice -InstanceId $script:DeviceInstId -ErrorAction SilentlyContinue } else { $null }
+    if (-not $dev) {
+        $replacement = Get-PnpDevice -ErrorAction SilentlyContinue |
+            Where-Object { $_.InstanceId -match 'VID_2104&PID_030C' -and $_.Class -eq 'USBDevice' } |
+            Select-Object -First 1
+        if ($replacement) { $dev = $replacement; $script:DeviceInstId = $replacement.InstanceId }
+    }
     $prob = $null
-    if ($dev) { try { $prob = (Get-PnpDeviceProperty -InstanceId $DeviceInstId -KeyName 'DEVPKEY_Device_ProblemCode' -EA SilentlyContinue).Data } catch {} }
+    if ($dev) { try { $prob = (Get-PnpDeviceProperty -InstanceId $script:DeviceInstId -KeyName 'DEVPKEY_Device_ProblemCode' -EA SilentlyContinue).Data } catch {} }
     $svcMw = (Get-Service 'Tobii Service' -EA SilentlyContinue).Status
     $svcRt = (Get-Service 'TobiiIS5YAMATO17' -EA SilentlyContinue).Status
     $eng = Get-CpuPct 'Tobii.EyeX.Engine'
@@ -89,6 +104,10 @@ function Get-Sample {
     $ac = '?'; $batt = $null
     try { $ps=[System.Windows.Forms.SystemInformation]::PowerStatus; $ac="$($ps.PowerLineStatus)"; $batt=[math]::Round($ps.BatteryLifePercent*100) } catch {}
     $script:prevAt = Get-Date
+    $recoveryPhase = $null
+    if (Test-Path -LiteralPath $RecoveryStateFile) {
+        try { $recoveryPhase = (Get-Content -LiteralPath $RecoveryStateFile -Raw | ConvertFrom-Json).phase } catch {}
+    }
     [ordered]@{
         ts     = (Get-Date -Format 'yyyy-MM-ddTHH:mm:ss')
         state  = $es.state
@@ -98,6 +117,7 @@ function Get-Sample {
         svcMw  = "$svcMw"
         svcRt  = "$svcRt"
         engCpu = $eng.cpu
+        engPresent = $eng.present
         engMem = $eng.mem
         rtCpu  = $rt.cpu
         inter  = $inter
@@ -106,7 +126,15 @@ function Get-Sample {
         ac     = $ac
         batt   = $batt
         paused = (Test-Path $PauseFlag)
+        recoveryPhase = $recoveryPhase
     }
+}
+
+function Write-Heartbeat {
+    try {
+        [ordered]@{ ts=(Get-Date -Format 'o'); pid=$PID } | ConvertTo-Json -Compress |
+            Set-Content -LiteralPath $HeartbeatFile -Encoding UTF8
+    } catch {}
 }
 
 function Write-Line($obj) {
@@ -156,15 +184,23 @@ if ($Stats) {
     if (-not $rows) { "No parseable telemetry."; exit 0 }
     $first=[datetime]$rows[0].ts; $last=[datetime]$rows[-1].ts
     $span=($last-$first).TotalHours
+    $sampledSec = 0.0
+    for ($i=1; $i -lt $rows.Count; $i++) {
+        $currentTs = [datetime]$rows[$i].ts
+        $previousTs = [datetime]$rows[$i-1].ts
+        $gap = ($currentTs - $previousTs).TotalSeconds
+        if ($gap -gt 0 -and $gap -le ($SampleSec * 2.5)) { $sampledSec += $gap }
+    }
+    $sampledHours = $sampledSec / 3600
     $drops = @($rows | Where-Object { $_.evt -eq 'drop' })
     $recs  = @($rows | Where-Object { $_.evt -eq 'recovered' })
     $outages = $recs | Where-Object { $_.outageSec } | ForEach-Object { [double]$_.outageSec }
     "===== Tobii health report ====="
     "window        : {0}  ->  {1}  ({2:N1} h)" -f $first,$last,$span
-    "samples       : {0}" -f $rows.Count
-    "drops         : {0}  ({1:N2}/hr)" -f $drops.Count, $(if($span){$drops.Count/$span}else{0})
+    "samples       : {0}  ({1:N1} sampled h; gaps excluded)" -f $rows.Count,$sampledHours
+    "drops         : {0}  ({1:N2}/sampled hr)" -f $drops.Count, $(if($sampledHours){$drops.Count/$sampledHours}else{0})
     "recoveries    : {0}" -f $recs.Count
-    if ($drops.Count) { "MTBF          : {0:N1} min between drops" -f $(if($drops.Count){($span*60)/$drops.Count}else{0}) }
+    if ($drops.Count) { "MTBF          : {0:N1} sampled min between drops" -f $(if($drops.Count){($sampledHours*60)/$drops.Count}else{0}) }
     if ($outages)     { "outage sec    : min={0} median={1} max={2} mean={3:N1}" -f ($outages|Measure-Object -Min).Minimum, ($outages|Sort-Object)[[int]($outages.Count/2)], ($outages|Measure-Object -Max).Maximum, ($outages|Measure-Object -Average).Average }
     $stateCounts = $rows | Group-Object state | Sort-Object Count -Descending
     "state distrib :"; $stateCounts | ForEach-Object { "   {0,-18} {1,5}  ({2:N1}%)" -f $_.Name,$_.Count,(100*$_.Count/$rows.Count) }
@@ -188,10 +224,16 @@ Get-Sample | Out-Null    # prime CPU deltas
 Start-Sleep -Seconds 2
 while ($true) {
     try {
+        Write-Heartbeat
         $s = Get-Sample
-        $isFault = ($s.state -eq 'WaitingForDevice')
+        $faultType = if (((Get-Date)-$MonitorStartedAt).TotalSeconds -lt 240) { $null }
+                     elseif ($s.dev -in @('absent','Unknown','Error')) { 'usb' }
+                     elseif ($s.svcMw -ne 'Running' -or -not $s.engPresent) { 'stack' }
+                     elseif ($s.state -eq 'WaitingForDevice') { 'connection' }
+                     else { $null }
+        $isFault = [bool]$faultType
         if (-not $prevFault -and $isFault) {
-            $s.evt = 'drop'; $dropAt = Get-Date
+            $s.evt = 'drop'; $s.faultType = $faultType; $dropAt = Get-Date
             Write-Snapshot 'drop'
         } elseif ($prevFault -and -not $isFault -and $dropAt) {
             $s.evt = 'recovered'; $s.outageSec = [int]((Get-Date)-$dropAt).TotalSeconds; $dropAt = $null

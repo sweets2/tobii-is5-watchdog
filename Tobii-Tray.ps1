@@ -31,6 +31,8 @@ $LogPath    = Join-Path $ScriptsDir 'Tobii-Watchdog.log'
 $RecalFlag  = Join-Path $ScriptsDir 'tobii-recal-needed.flag'
 $RebootFlag = Join-Path $ScriptsDir 'tobii-reboot-needed.flag'
 $RecoveringFlag = Join-Path $ScriptsDir 'tobii-recovering.flag'
+$HeartbeatFile = Join-Path $ScriptsDir 'tobii-watchdog.heartbeat.json'
+$RecoveryStateFile = Join-Path $ScriptsDir 'tobii-recovery-state.json'
 
 $state = @{ mode = 'active'; autoGames = $false }
 if (Test-Path $Settings) {
@@ -68,6 +70,7 @@ $icoGame       = New-DotIcon ([System.Drawing.Color]::Gold)       # game pause i
 $icoRecal      = New-DotIcon ([System.Drawing.Color]::Red)        # red = failure
 $icoRecovering = New-DotIcon ([System.Drawing.Color]::DodgerBlue) # blue = fixing it now
 $icoSleep      = New-DotIcon ([System.Drawing.Color]::Orange)     # orange = NEEDS SLEEP (manual)
+$icoOffline    = New-DotIcon ([System.Drawing.Color]::Gray)       # gray = watchdog heartbeat stale
 
 $ni   = New-Object System.Windows.Forms.NotifyIcon
 $menu = New-Object System.Windows.Forms.ContextMenuStrip
@@ -79,6 +82,7 @@ $miReconnect = New-Object System.Windows.Forms.ToolStripMenuItem "Reconnect now 
 $miWarp      = New-Object System.Windows.Forms.ToolStripMenuItem "Fix cursor warp (gaze OK, warp dead)"
 $miReapply   = New-Object System.Windows.Forms.ToolStripMenuItem "Re-apply saved calibration (no dots)"
 $miRecal     = New-Object System.Windows.Forms.ToolStripMenuItem "Recalibrate now (open Tobii app)"
+$miSleep     = New-Object System.Windows.Forms.ToolStripMenuItem "Sleep/wake tracker now (manual confirmation)"
 $miToggle    = New-Object System.Windows.Forms.ToolStripMenuItem "Pause auto-recovery"
 $miAuto      = New-Object System.Windows.Forms.ToolStripMenuItem "Auto-pause in fullscreen games"
 $miAuto.CheckOnClick = $true
@@ -98,6 +102,7 @@ $sep3 = New-Object System.Windows.Forms.ToolStripSeparator
 [void]$menu.Items.Add($miWarp)
 [void]$menu.Items.Add($miReapply)
 [void]$menu.Items.Add($miRecal)
+[void]$menu.Items.Add($miSleep)
 [void]$menu.Items.Add($sep2)
 [void]$menu.Items.Add($miAuto)
 [void]$menu.Items.Add($sep3)
@@ -121,9 +126,18 @@ function Apply-State {
     $rebootNeeded = Test-Path $RebootFlag
     $recalNeeded  = Test-Path $RecalFlag
     $recovering   = Test-Path $RecoveringFlag
+    $watchdogOnline = $false
+    if (Test-Path -LiteralPath $HeartbeatFile) {
+        try { $watchdogOnline = (((Get-Date) - (Get-Item -LiteralPath $HeartbeatFile).LastWriteTime).TotalSeconds -lt 120) } catch {}
+    }
+    $phase = $null
+    if (Test-Path -LiteralPath $RecoveryStateFile) {
+        try { $phase = (Get-Content -LiteralPath $RecoveryStateFile -Raw | ConvertFrom-Json).phase } catch {}
+    }
     if ($rebootNeeded)              { $ni.Icon = $icoSleep;  $txt = 'NEEDS SLEEP - run SleepWake Tracker (tracker off USB)' }
     elseif ($recalNeeded)           { $ni.Icon = $icoRecal;  $txt = 'RECALIBRATION NEEDED' }
-    elseif ($recovering)            { $ni.Icon = $icoRecovering; $txt = 'Auto-recovering (drop caught, fixing now)' }
+    elseif (-not $watchdogOnline)   { $ni.Icon = $icoOffline; $txt = 'WATCHDOG OFFLINE (supervisor should restart it)' }
+    elseif ($recovering -or $phase) { $ni.Icon = $icoRecovering; $txt = "Auto-recovering$(if($phase){': '+$phase}else{''})" }
     elseif ($state.mode -eq 'paused') { $ni.Icon = $icoPaused; $txt = 'Paused (manual)' }
     elseif ($gameActive)            { $ni.Icon = $icoGame;   $txt = 'Auto-paused (game)' }
     else                            { $ni.Icon = $icoActive; $txt = 'Active' }
@@ -141,10 +155,13 @@ function Apply-State {
         $script:wasRecovering = $false
     }
 
-    $ni.Text       = "Tobii Watchdog: $txt"
+    $tooltip = "Tobii Watchdog: $txt"
+    if ($tooltip.Length -gt 63) { $tooltip = $tooltip.Substring(0,63) }
+    $ni.Text       = $tooltip
     $miStatus.Text = "Status: $txt"
     $miToggle.Text = if ($state.mode -eq 'paused') { 'Resume auto-recovery' } else { 'Pause auto-recovery' }
     $miAuto.Checked = [bool]$state.autoGames
+    $miSleep.Visible = $rebootNeeded
 
     # Reboot/sleep-needed: the watchdog tried everything, incl. re-enumerating the
     # tracker's USB port, and the device is still off the bus = a firmware wedge that
@@ -224,6 +241,19 @@ function Invoke-ReconnectNow {
     }
 }
 
+function Invoke-ManualSleepWake {
+    # This remains owner-initiated. The watchdog never calls the sleep helper.
+    $answer = [System.Windows.Forms.MessageBox]::Show(
+        'This will put the PC to sleep briefly and wake it with a timer. Continue now?',
+        'Tobii - manual tracker power cycle',
+        [System.Windows.Forms.MessageBoxButtons]::YesNo,
+        [System.Windows.Forms.MessageBoxIcon]::Warning)
+    if ($answer -ne [System.Windows.Forms.DialogResult]::Yes) { return }
+    $helper = 'C:\Scripts\SleepWake-Tracker.bat'
+    if (Test-Path -LiteralPath $helper) { Start-Process -FilePath $helper }
+    else { $ni.ShowBalloonTip(5000, 'Tobii', 'SleepWake-Tracker.bat was not found.', [System.Windows.Forms.ToolTipIcon]::Warning) }
+}
+
 function Toggle-Pause {
     $state.mode = if ($state.mode -eq 'paused') { 'active' } else { 'paused' }
     Save-Settings; Apply-State
@@ -281,7 +311,11 @@ $miWarp.add_Click({
     }
 })
 $miRecal.add_Click({ Open-TobiiCalibration })
-$ni.add_BalloonTipClicked({ if (Test-Path $RecalFlag) { Open-TobiiCalibration } })
+$miSleep.add_Click({ Invoke-ManualSleepWake })
+$ni.add_BalloonTipClicked({
+    if (Test-Path $RebootFlag) { Invoke-ManualSleepWake }
+    elseif (Test-Path $RecalFlag) { Open-TobiiCalibration }
+})
 $miToggle.add_Click({ Toggle-Pause })
 $miAuto.add_Click({ $state.autoGames = $miAuto.Checked; Save-Settings; Apply-State })
 $miStats.add_Click({

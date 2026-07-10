@@ -5,6 +5,10 @@ Tobii-Watchdog-*.log
 Tobii-Telemetry*.jsonl
 watchdog.pause
 tray.settings.json
+tobii-*.flag
+tobii-*.heartbeat.json
+tobii-recovery-state.json
+tobii-force-reconnect.request
 Tobii-Diagnostics/
 snapshots/
 

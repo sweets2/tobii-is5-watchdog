@@ -189,6 +189,26 @@ if (Test-Path $monitor) {
     Write-Host "   (Tobii-Monitor.ps1 not found; skipping monitor)" -ForegroundColor Yellow
 }
 
+Write-Host "== 2f. Registering watchdog/monitor sentinel ==" -ForegroundColor Cyan
+$sentinel = Join-Path $ScriptDir 'Tobii-Sentinel.ps1'
+$sentinelName = 'TobiiSentinel'
+if (Test-Path $sentinel) {
+    Unregister-ScheduledTask -TaskName $sentinelName -Confirm:$false -ErrorAction SilentlyContinue
+    $sentinelAction = New-ScheduledTaskAction -Execute $psExe `
+        -Argument "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$sentinel`""
+    $sentinelTrigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) `
+        -RepetitionInterval (New-TimeSpan -Minutes 1) -RepetitionDuration (New-TimeSpan -Days 3650)
+    $sentinelSettings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
+        -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Minutes 1) -MultipleInstances IgnoreNew
+    Register-ScheduledTask -TaskName $sentinelName -Action $sentinelAction -Trigger $sentinelTrigger `
+        -Principal $principal -Settings $sentinelSettings `
+        -Description 'Restarts the Tobii watchdog or passive monitor if their heartbeat becomes stale.' | Out-Null
+    Start-ScheduledTask -TaskName $sentinelName -ErrorAction SilentlyContinue
+    Write-Host "   registered + started '$sentinelName' (one-minute heartbeat supervision)."
+} else {
+    Write-Host "   (Tobii-Sentinel.ps1 not found; skipping process supervision)" -ForegroundColor Yellow
+}
+
 Write-Host "== 2c. Registering the tray utility to start at logon ==" -ForegroundColor Cyan
 $trayVbs = Join-Path $ScriptDir 'Tobii-Tray.vbs'
 if (Test-Path $trayVbs) {

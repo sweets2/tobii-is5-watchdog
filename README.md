@@ -32,9 +32,10 @@ Full evidence, quantified logs, and the five distinct failure modes (A–E) are 
 
 | Component | Role |
 |---|---|
-| `Tobii-Watchdog.ps1` | Passive watchdog. Reads the engine's `ServerLog.txt` (never touches the gaze stream) and auto-recovers when it's stuck in `WaitingForDevice`. Also checks the stack is actually *running* (service + engine process), so a crash or dirty cold boot can't hide behind a stale "Tracking" log line — and catches the **silent stall** where the engine *claims* Tracking but does no gaze work (near-zero CPU while you're actively at the machine). |
-| `Tobii-Tray.ps1` / `.vbs` | System-tray app: **Reconnect now**, **Fix cursor warp**, **Recalibrate now**, Pause/Resume auto-recovery, auto-pause in fullscreen games, Health report, Recent disconnects. Instant reconnect on sleep/resume, power-source, and display changes. Turns **red + notifies you** when the watchdog determines a recalibration is needed. |
-| `Tobii-Monitor.ps1` | Passive telemetry recorder (observe-only): logs drops/recoveries + snapshots to help diagnose. `-Stats` prints MTBF / drops-per-hour / outage lengths. |
+| `Tobii-Watchdog.ps1` | Passive watchdog. Reads the engine log and process load (never the gaze stream), serializes every recovery request through one coordinator, and runs a bounded recovery state machine. It learns a healthy CPU baseline and catches both near-zero and 4–6% half-alive stalls, including a conservative quiet-user path. |
+| `Tobii-Tray.ps1` / `.vbs` | System-tray app: **Reconnect now**, **Fix cursor warp**, **Recalibrate now**, manual **Sleep/wake tracker**, Pause/Resume, Health report, and Recent disconnects. Shows recovery phase and a gray offline state when the watchdog heartbeat is stale. |
+| `Tobii-Monitor.ps1` | Passive telemetry recorder (observe-only): logs typed incidents/recoveries + snapshots, watchdog recovery phase, and gap-aware statistics. |
+| `Tobii-Sentinel.ps1` | Supervises the watchdog and telemetry heartbeat files and restarts those processes if they hang. It never touches the Tobii stack or machine power. |
 | `Tobii-CalReapply.cs` → `.exe` | The **Mode-D fix**: re-pushes the tracker's *stored* calibration to the live engine after a hibernate-resume — **no restart, no recalibration dots**. Uses the safe engine-IPC path (`Tobii.Interaction`), never a raw gaze stream. Compiled by the installer with the built-in .NET compiler. |
 | `Install-TobiiWatchdog.ps1` | Registers the scheduled tasks + tray autostart, disables USB selective suspend for the device, and builds `Tobii-CalReapply.exe`. |
 | `Uninstall-TobiiWatchdog.ps1` | Removes everything. |
@@ -70,9 +71,9 @@ Uninstall: `powershell -ExecutionPolicy Bypass -File "C:\Scripts\Uninstall-Tobii
   Request Failed" node — **without a reboot**. It touches only the tracker's own port
   (never the shared hub/keyboard) and verifies the device ends *enabled*, so it's safe
   to run automatically. If even a port re-enumeration can't bring the device back, the
-  watchdog stops thrashing and raises a **"reboot needed"** tray notification (a
-  firmware/hardware wedge only a reboot clears). A *blanket* USB power-cycle stays
-  manual-only (`Reconnect now`) — it once left the device disabled.
+  watchdog stops thrashing and raises a **manual sleep/wake needed** notification.
+  On this machine a short owner-initiated S3 cycle restores the electrically absent
+  tracker; the watchdog never sleeps or reboots the PC itself.
 - **Auto-recovers a dead stack** — if the Tobii service or engine process is
   missing (crash, or a cold boot after the battery died in sleep), that's a fault
   too, with a post-boot grace so it never fights the service's delayed autostart.
@@ -86,17 +87,21 @@ Uninstall: `powershell -ExecutionPolicy Bypass -File "C:\Scripts\Uninstall-Tobii
   minutes at ~0.3% CPU; healthy tracking runs ~8–13%; the IR LEDs go dark). This
   is the classic hibernate-resume failure: the tracker's calibration is volatile
   firmware state, wiped when hibernate cuts its power, and no restart re-binds it.
-  The watchdog samples engine CPU while you're *actively giving input* (still
-  fully passive, no gaze subscription) and, on a confirmed stall, **re-applies
+  The watchdog compares engine CPU with a learned healthy baseline. It has a fast
+  user-active path plus a slower quiet-session path, because dead gaze can itself
+  stop conventional input. On a confirmed stall it **re-applies
   your *stored* calibration to the engine** (`Tobii-CalReapply.exe`) — the same
   thing the calibration UI does, minus the dots — in about a second, with no
   restart. This runs first (it's cheap and non-disruptive); only if it *and* the
-  full restart/USB-power-cycle ladder fail to bring gaze back (e.g. no stored
-  calibration exists) does the tray go **red** and ask you to recalibrate. On
+  clean restart/port-re-enumeration ladder fail to bring gaze back does it classify
+  the terminal state: failed calibration becomes **red/recalibrate**, while a
+  successfully calibrated but still degraded imaging session becomes
+  **orange/manual sleep**. On
   resume it also fires immediately, so gaze is back the moment you sit down.
   There's a manual **"Re-apply saved calibration"** tray item too.
-- **Safe by design:** it only *reads* the log, only acts on genuine fault
-  states, and never intervenes during calibration.
+- **Safe by design:** it never subscribes to gaze, never intervenes during
+  calibration, and never sleeps or reboots the PC automatically. Wake, tray, and
+  main-loop recoveries share a global coordinator so they cannot collide.
 - **What it can't auto-fix:** a *first-time* or genuinely corrupt calibration —
   if no valid calibration was ever stored, there's nothing to re-apply and you
   must do the dots once (it detects and notifies). And the rare "streaming but
@@ -118,8 +123,8 @@ Uninstall: `powershell -ExecutionPolicy Bypass -File "C:\Scripts\Uninstall-Tobii
 
 - Windows only; PowerShell 5.1 (built in). Some actions need admin (the installer
   self-elevates).
-- Recovery restarts the Tobii services/engine (a ~10s blip); it never reboots the
-  PC or closes your other apps.
+- Recovery can take roughly one to three minutes when the legacy EyeX engine needs
+  a cold start; it never reboots, sleeps, or closes your other apps automatically.
 - Provided as-is under the MIT license. It restarts vendor services and power-cycles
   a USB device; read the scripts before running.
 

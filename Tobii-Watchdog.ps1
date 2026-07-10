@@ -8,9 +8,8 @@
 
     IMPORTANT: this watchdog never subscribes to gaze. A second gaze subscriber
     breaks this hardware (it resets every ~2-3s). Passive log reading is the only
-    safe approach, so it catches the connection-drop outages but NOT the rarer
-    "streaming but frozen/invalid" stall -- use the tray's "Reconnect now" button
-    for that.
+    safe approach. Silent stalls are inferred passively from the engine's learned
+    CPU baseline; the script never opens a second stream.
 
     STACK-PRESENCE CHECK: the log state alone can be a lie. After a crash or a
     cold boot (e.g. battery died in sleep) the last ServerLog line still says
@@ -25,15 +24,16 @@
     said Tracking but the engine sat at ~0.3% CPU for 22 min (healthy tracking
     with a user in front is ~8-13%) because the device had lost its calibration.
     Detection is still fully passive: state == Tracking AND the console user is
-    actively giving input (so the tracker SHOULD be seeing eyes) AND engine CPU
-    stays at idle level across a sample window, twice in a row. Recovery ladder:
-    stack restart -> full reconnect (USB power-cycle) -> give up and raise the
-    'recalibration needed' flag, which the tray turns into a notification.
+    actively giving input, or the engine recently collapsed from verified healthy
+    load while the session remains unlocked, AND CPU stays below its learned
+    threshold across multiple samples. Recovery ladder: calibration re-apply ->
+    clean stack restart -> one verified port re-enumeration -> classify the
+    terminal result as recalibration-needed or manual-sleep-needed.
     Caveat: typing with the tracker blind (lid closed on an external monitor)
     looks identical; the cooldown caps that at one ladder per $StallCooldownMin.
 
-    Recovery escalation (auto): 1 = restart runtime service; 2+ = kill+respawn
-    EyeX engine, restart runtime + service. EVERY level then bounces the interaction
+    Recovery escalation (auto): 1 = restart runtime service; 2 = deterministic
+    stop/start of middleware, engine, interaction and runtime. Every recovery bounces the interaction
     process once Tracking returns, so the gaze->cursor warp re-binds (restarting the
     runtime service alone breaks that binding = gaze works but the cursor warp is
     dead). If WaitingForDevice persists with the
@@ -41,9 +41,8 @@
     hibernate/sleep resume), it re-enumerates the tracker's OWN USB port (safe: only
     its port, and it verifies the device ends ENABLED) -- this recovers a device that
     plain restarts cannot, with NO reboot. If even that cannot bring it back it raises
-    a REBOOT-needed flag (tray notification) and stops thrashing. (A blanket USB
-    power-cycle stays OUT of auto -- it once left the device DISABLED -- and remains
-    manual-only via -ForceReconnect / the full-reconnect path.)
+    a manual-S3-needed flag (tray notification) and stops thrashing. USB recovery is
+    limited to one verified re-enumeration per transaction.
 
     Modes:  -Once  print state & exit   -ForceReconnect  full reconnect & exit
             -OnWake  resume-from-sleep reconnect if not tracking
@@ -59,9 +58,13 @@ param(
     [int]$MaxLogBytes      = 1048576,
     [string]$PauseFlag     = 'C:\Scripts\watchdog.pause',
     [string]$ServerLog     = "",
-    [double]$StallCpuPct       = 1.5,
+    [double]$StallCpuPct       = 6.0,
+    [double]$HardStallCpuPct   = 1.5,
     [int]$StallIdleMaxSec      = 60,
     [int]$StallCheckEverySec   = 60,
+    [int]$QuietStallStrikes    = 3,
+    [int]$ClusterWindowMin     = 30,
+    [int]$ClusterEscalateCount = 3,
     [int]$StallCooldownMin     = 45,
     [int]$ResumeGapSec         = 90,
     [int]$BurstSec             = 150,
@@ -69,7 +72,10 @@ param(
     [string]$RecalFlag         = 'C:\Scripts\tobii-recal-needed.flag',
     [string]$RebootNeededFlag  = 'C:\Scripts\tobii-reboot-needed.flag',
     [string]$RecoveringFlag    = 'C:\Scripts\tobii-recovering.flag',
-    [int]$UsbHangRebootLevel   = 5,
+    [string]$HeartbeatFile     = 'C:\Scripts\tobii-watchdog.heartbeat.json',
+    [string]$RecoveryStateFile = 'C:\Scripts\tobii-recovery-state.json',
+    [string]$RecoveryRequestFile = 'C:\Scripts\tobii-force-reconnect.request',
+    [int]$UsbHangRebootLevel   = 2,
     [switch]$Once,
     [switch]$ForceReconnect,
     [switch]$OnWake,
@@ -83,6 +89,62 @@ $ErrorActionPreference = 'Continue'
 # mid-run. So we act only on the genuine PRP-drop signature: WaitingForDevice.
 $FaultStates   = @('WaitingForDevice')
 $HealthyStates = @('Tracking','Idle')   # (kept for -Once display only)
+$RecoveryMutexName = 'Global\TobiiRecoveryCoordinator'
+$script:RecoveryMutex = $null
+$script:RecoveryDepth = 0
+$script:RecoveryPhase = 'monitoring'
+
+# Every process that can mutate the Tobii stack (main loop, wake task, tray task,
+# manual reconnect) shares this mutex. The old main-loop-only mutex allowed those
+# paths to overlap and restart services underneath each other.
+function Enter-RecoveryCoordinator {
+    param([string]$Reason, [int]$TimeoutSec = 2)
+    if ($script:RecoveryDepth -gt 0) {
+        $script:RecoveryDepth++
+        return $true
+    }
+    try {
+        $m = New-Object System.Threading.Mutex($false, $RecoveryMutexName)
+        if (-not $m.WaitOne([TimeSpan]::FromSeconds($TimeoutSec))) {
+            $m.Dispose()
+            Write-Log "Recovery request '$Reason' coalesced: another recovery is already running." 'WARN'
+            return $false
+        }
+        $script:RecoveryMutex = $m
+        $script:RecoveryDepth = 1
+        Set-RecoveryPhase -Phase 'starting' -Reason $Reason
+        return $true
+    } catch {
+        Write-Log "Could not acquire recovery coordinator: $($_.Exception.Message)" 'ERROR'
+        return $false
+    }
+}
+function Exit-RecoveryCoordinator {
+    if ($script:RecoveryDepth -le 0) { return }
+    $script:RecoveryDepth--
+    if ($script:RecoveryDepth -gt 0) { return }
+    try { Remove-Item -LiteralPath $RecoveryStateFile -Force -ErrorAction SilentlyContinue } catch {}
+    try { $script:RecoveryMutex.ReleaseMutex() } catch {}
+    try { $script:RecoveryMutex.Dispose() } catch {}
+    $script:RecoveryMutex = $null
+    $script:RecoveryPhase = 'monitoring'
+    Update-Heartbeat
+}
+function Set-RecoveryPhase {
+    param([string]$Phase, [string]$Reason = '')
+    $script:RecoveryPhase = $Phase
+    try {
+        [ordered]@{ ts=(Get-Date -Format 'o'); pid=$PID; phase=$Phase; reason=$Reason } |
+            ConvertTo-Json -Compress | Set-Content -LiteralPath $RecoveryStateFile -Encoding UTF8
+    } catch {}
+    Update-Heartbeat
+}
+function Update-Heartbeat {
+    try {
+        [ordered]@{ ts=(Get-Date -Format 'o'); pid=$PID; phase=$script:RecoveryPhase } |
+            ConvertTo-Json -Compress | Set-Content -LiteralPath $HeartbeatFile -Encoding UTF8
+    } catch {}
+}
 
 # Never recover while the Tobii calibration/config UI is open (setup in progress).
 function Test-ConfigActive {
@@ -150,28 +212,51 @@ function Get-EngineCpuPct {
     if (-not $p1) { return $null }
     $cpu1 = $p1.CPU
     Start-Sleep -Seconds $SampleSec
+    Update-Heartbeat
     $p2 = Get-Process -Id $p1.Id -ErrorAction SilentlyContinue
     if (-not $p2 -or $p2.ProcessName -ne 'Tobii.EyeX.Engine') { return $null }
     return [Math]::Round((($p2.CPU - $cpu1) / $SampleSec) * 100, 1)
 }
+function Get-DegradedCpuThreshold {
+    # Learn this machine's healthy engine load, but keep the decision boundary in
+    # a conservative range. The observed frozen 4.1% state must not pass as healthy.
+    $baseline = if ($script:HealthyCpuEwma) { $script:HealthyCpuEwma } else { 12.0 }
+    return [Math]::Round([Math]::Min($StallCpuPct, [Math]::Max(4.5, $baseline * 0.45)), 1)
+}
 function Test-SilentStall {
-    # True only when ALL hold: stack up, engine claims Tracking, the user was
-    # giving input just now (tracker should see them), and engine CPU sampled
-    # at idle level. Cheap gates run first; the CPU sample blocks ~12s.
+    # Returns 'active' or 'quiet' for a degraded sample, otherwise $null. The
+    # quiet path closes the gaze-user catch-22: dead gaze causes input-idle, so
+    # conventional input cannot be a mandatory detector gate.
     if (Get-StackDownReason) { return $false }
-    if ((Get-ConsoleIdleSec) -gt $StallIdleMaxSec) { return $false }
     if ((Get-TrackerState) -ne 'Tracking') { return $false }
+    if ([bool](Get-Process -Name 'LogonUI' -ErrorAction SilentlyContinue)) { return $false }
+    $active = ((Get-ConsoleIdleSec) -le $StallIdleMaxSec)
+    if (-not $active -and (-not $script:LastVerifiedHealthy -or
+        ((Get-Date) - $script:LastVerifiedHealthy).TotalMinutes -gt 10)) {
+        return $null
+    }
     $cpu = Get-EngineCpuPct -SampleSec 12
-    if ($null -eq $cpu -or $cpu -ge $StallCpuPct) { return $false }
-    # user must still have been around during the sample window
-    if ((Get-ConsoleIdleSec) -gt ($StallIdleMaxSec + 15)) { return $false }
-    Write-Log ("Silent-stall sample: state=Tracking, engine CPU ${cpu}%, user active.") 'WARN'
+    if ($null -eq $cpu) { return $null }
+    $script:LastHealthSampleCpu = $cpu
+    $threshold = Get-DegradedCpuThreshold
+    if ($cpu -ge $threshold) {
+        if ($active -and $cpu -ge 8) {
+            $baseline = if ($script:HealthyCpuEwma) { $script:HealthyCpuEwma } else { 12.0 }
+            $script:HealthyCpuEwma = [Math]::Round((0.8 * $baseline) + (0.2 * $cpu), 1)
+            $script:LastVerifiedHealthy = Get-Date
+        }
+        return $null
+    }
+    $kind = if ($active) { 'active' } else { 'quiet' }
+    $severity = if ($cpu -lt $HardStallCpuPct) { 'dead' } else { 'degraded' }
+    Write-Log ("Silent-stall sample: state=Tracking, engine CPU ${cpu}% (<${threshold}%), mode=$kind severity=$severity.") 'WARN'
     # Degradation bookkeeping: single samples (below the 2-consecutive-strikes action
     # threshold) still mark the device as degraded since its last clean re-enumeration.
     # The 07-10 hard wedge was preceded by an HOUR of such samples; they arm the
     # preventive at-lock reconnect (see main loop).
     $script:StallDegradationCount++
-    return $true
+    $script:LastStallCpu = $cpu
+    return $kind
 }
 function Get-CalibrationFile {
     Get-ChildItem 'C:\ProgramData\Tobii\Tobii Platform Runtime\*\*\calibration.setpm' -ErrorAction SilentlyContinue |
@@ -194,10 +279,11 @@ function Clear-RecalNeeded {
 function Set-RebootNeeded {
     # Distinct from recal-needed: the tracker fell off the USB bus and even a port
     # re-enumeration could not bring it back = a firmware/hardware wedge that only a
-    # reboot clears. The tray shows this as a separate "reboot needed" notification.
+    # owner-initiated S3 power cycle clears. The legacy filename is retained for
+    # compatibility, but the UI calls this "manual sleep needed."
     param([string]$Reason)
     if (-not (Test-Path -LiteralPath $RebootNeededFlag)) {
-        Write-Log ("Raising REBOOT-needed flag: $Reason") 'ERROR'
+        Write-Log ("Raising MANUAL-SLEEP-needed flag: $Reason") 'ERROR'
         try { Set-Content -LiteralPath $RebootNeededFlag -Value ("{0} {1}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $Reason) } catch { }
     }
 }
@@ -220,27 +306,6 @@ function Clear-Recovering {
     if (Test-Path -LiteralPath $RecoveringFlag) {
         try { Remove-Item -LiteralPath $RecoveringFlag -Force -ErrorAction SilentlyContinue } catch { }
     }
-}
-function Test-StallCleared {
-    # After a recovery step: wait for a fresh Tracking, then confirm the engine
-    # is actually working (CPU at tracking level while the user is present).
-    param([datetime]$Since)
-    if (-not (Wait-ForTracking -TimeoutSec 90 -Since $Since)) { return $false }
-    Start-Sleep -Seconds 5
-    for ($i = 0; $i -lt 6; $i++) {
-        if ((Get-ConsoleIdleSec) -le $StallIdleMaxSec) {
-            $cpu = Get-EngineCpuPct -SampleSec 10
-            if ($null -ne $cpu) {
-                Write-Log ("Stall-recovery verify: engine CPU ${cpu}%.")
-                return ($cpu -ge $StallCpuPct)
-            }
-        }
-        Start-Sleep -Seconds 10
-    }
-    # User stepped away mid-verification; assume cleared -- the periodic stall
-    # check will fire again if it is not.
-    Write-Log 'Stall-recovery verify: user idle, cannot confirm; assuming cleared.'
-    return $true
 }
 function Invoke-CalReapply {
     # Mode-D primary fix: re-push the tracker's STORED calibration blob to the live
@@ -268,22 +333,26 @@ function Invoke-CalReapply {
 }
 function Test-GazeWorking {
     # Verify real gaze work resumed (engine CPU at tracking level while the user is
-    # present). Unlike Test-StallCleared this does NOT wait for a fresh 'Tracking'
-    # line -- a bare re-apply produces no state transition (the engine was already
+    # present). It does NOT require a fresh 'Tracking' line -- a bare re-apply
+    # produces no state transition (the engine was already
     # 'Tracking'); it just starts doing gaze work again.
+    if (Get-StackDownReason) { return 'unhealthy' }
     Start-Sleep -Seconds 4
+    $sawActiveUser = $false
     for ($i = 0; $i -lt 4; $i++) {
         if ((Get-ConsoleIdleSec) -le $StallIdleMaxSec) {
+            $sawActiveUser = $true
             $cpu = Get-EngineCpuPct -SampleSec 10
             if ($null -ne $cpu) {
                 Write-Log ("Gaze-recovery verify: engine CPU ${cpu}%.")
-                return ($cpu -ge $StallCpuPct)
+                return $(if ($cpu -ge (Get-DegradedCpuThreshold)) { 'healthy' } else { 'unhealthy' })
             }
         }
         Start-Sleep -Seconds 8
     }
-    Write-Log 'Gaze-recovery verify: user idle, cannot confirm; assuming cleared.'
-    return $true
+    if ($sawActiveUser) { return 'unhealthy' }
+    Write-Log 'Gaze-recovery verify: user idle; result remains unverified.' 'WARN'
+    return 'unknown'
 }
 function Invoke-StallRecovery {
     # Ladder for the 'Tracking-but-dead' stall (Mode B/D). Order changed now that we
@@ -294,15 +363,24 @@ function Invoke-StallRecovery {
     # -IgnoreCooldown: a fresh wake/boot is a legitimate event (not restart-thrashing),
     # so the anti-thrash cooldown is skipped for the first post-transition recovery.
     param([switch]$IgnoreCooldown)
+    if (-not (Enter-RecoveryCoordinator -Reason 'silent-stall')) { return }
+    try {
     $inCooldown = (-not $IgnoreCooldown) -and $script:LastStallRecovery -and (((Get-Date) - $script:LastStallRecovery).TotalMinutes -lt $StallCooldownMin)
     if ($inCooldown) {
         # Inside the restart cooldown (anti-thrash). A calibration re-apply is free
         # (no restart) -- try it first.
         Write-Log 'Silent stall within restart cooldown; trying calibration re-apply first.' 'WARN'
-        if ((Invoke-CalReapply) -and (Test-GazeWorking)) {
-            Write-Log 'Stall cleared by calibration re-apply (cooldown path).'
-            Clear-RecalNeeded 'calibration re-applied'
-            return
+        Set-RecoveryPhase -Phase 'calibration-reapply' -Reason 'cooldown stall'
+        if (Invoke-CalReapply) {
+            $verify = Test-GazeWorking
+            if ($verify -eq 'healthy') {
+                Write-Log 'Stall cleared by calibration re-apply (cooldown path).'
+                Clear-RecalNeeded 'calibration re-applied'
+                return
+            } elseif ($verify -eq 'unknown') {
+                Write-Log 'Calibration re-apply completed; recovery pending user-present verification.' 'WARN'
+                return
+            }
         }
         # Re-apply was not enough. Allow ONE reconnect per cooldown window before
         # giving up -- a fresh re-stall (e.g. a second hibernate wake soon after the
@@ -311,16 +389,18 @@ function Invoke-StallRecovery {
         if (-not $script:CooldownReconnectDone) {
             $script:CooldownReconnectDone = $true
             Write-Log 'Re-apply insufficient in cooldown; one reconnect before flagging.' 'WARN'
-            $tc = Get-Date
-            Invoke-Recovery -Level 2
-            if (Wait-ForTracking -TimeoutSec 90 -Since $tc) { Invoke-CalReapply | Out-Null }
-            if (Test-GazeWorking) {
+            if (Invoke-Recovery -Level 2) { Invoke-CalReapply | Out-Null }
+            $verify = Test-GazeWorking
+            if ($verify -eq 'healthy') {
                 Write-Log 'Stall cleared by cooldown reconnect + re-apply.'
                 Clear-RecalNeeded 'engine tracking again'
                 return
+            } elseif ($verify -eq 'unknown') {
+                Write-Log 'Cooldown reconnect completed; recovery pending user-present verification.' 'WARN'
+                return
             }
         }
-        Set-RecalNeeded 'stall persisted; re-apply + one cooldown reconnect did not restore gaze'
+        Set-RebootNeeded 'tracker remains electrically present but its imaging session stayed degraded; manual sleep/wake required'
         return
     }
     $script:LastStallRecovery = Get-Date
@@ -329,38 +409,59 @@ function Invoke-StallRecovery {
     Write-Log 'SILENT STALL confirmed: engine claims Tracking at idle CPU while user is active. Starting recovery.' 'ERROR'
 
     # Step 0 -- primary Mode-D fix: re-apply stored calibration (fast, no restart).
-    if ((Invoke-CalReapply) -and (Test-GazeWorking)) {
-        Write-Log 'Stall cleared by calibration re-apply (no restart needed).'
-        Clear-RecalNeeded 'calibration re-applied'
-        return
+    Set-RecoveryPhase -Phase 'calibration-reapply' -Reason 'silent stall'
+    $calOk = Invoke-CalReapply
+    if ($calOk) {
+        $verify = Test-GazeWorking
+        if ($verify -eq 'healthy') {
+            Write-Log 'Stall cleared by calibration re-apply (no restart needed).'
+            Clear-RecalNeeded 'calibration re-applied'
+            return
+        } elseif ($verify -eq 'unknown') {
+            Write-Log 'Calibration re-apply completed; recovery pending user-present verification.' 'WARN'
+            return
+        }
     }
 
     # Step 1 -- stack restart, wait for a fresh Tracking, then re-apply calibration.
     Write-Log 'Re-apply alone did not clear it; escalating to stack restart.' 'WARN'
-    $t0 = Get-Date
-    Invoke-Recovery -Level 2
-    if (Wait-ForTracking -TimeoutSec 90 -Since $t0) { Invoke-CalReapply | Out-Null }
-    if (Test-GazeWorking) {
+    if (Invoke-Recovery -Level 2) { $calOk = (Invoke-CalReapply) -or $calOk }
+    $verify = Test-GazeWorking
+    if ($verify -eq 'healthy') {
         Write-Log 'Stall cleared by stack restart + calibration re-apply.'
         Clear-RecalNeeded 'engine tracking again'
         return
-    }
-
-    # Step 2 -- full reconnect (USB power-cycle), wait, then re-apply calibration.
-    Write-Log 'Stall survived stack restart; escalating to full reconnect (USB power-cycle).' 'WARN'
-    $t1 = Get-Date
-    Invoke-FullReconnect
-    if (Wait-ForTracking -TimeoutSec 90 -Since $t1) { Invoke-CalReapply | Out-Null }
-    if (Test-GazeWorking) {
-        Write-Log 'Stall cleared by full reconnect + calibration re-apply.'
-        Clear-RecalNeeded 'engine tracking again'
+    } elseif ($verify -eq 'unknown') {
+        Write-Log 'Stack restart completed; recovery pending user-present verification.' 'WARN'
         return
     }
 
-    # Exhausted: even re-applying the stored calibration did not bring gaze back --
-    # genuine loss (e.g. no stored calibration exists). Ask the user to recalibrate.
-    Write-Log 'Stall survived re-apply + full ladder; genuine calibration loss (recalibration needed).' 'ERROR'
-    Set-RecalNeeded 'auto-recovery + calibration re-apply exhausted'
+    # Step 2 -- one port re-enumeration + clean stack restart, then calibration.
+    Write-Log 'Stall survived stack restart; escalating to full reconnect.' 'WARN'
+    if (Invoke-FullReconnect) { $calOk = (Invoke-CalReapply) -or $calOk }
+    $verify = Test-GazeWorking
+    if ($verify -eq 'healthy') {
+        Write-Log 'Stall cleared by full reconnect + calibration re-apply.'
+        Clear-RecalNeeded 'engine tracking again'
+        return
+    } elseif ($verify -eq 'unknown') {
+        Write-Log 'Full reconnect completed; recovery pending user-present verification.' 'WARN'
+        return
+    }
+
+    # A successful calibration push followed by persistently dead imaging is not a
+    # calibration problem. The observed 4-5% half-alive state needs a rail reset.
+    if ($calOk) {
+        Write-Log 'Stall survived the software ladder despite successful calibration; manual sleep/wake required.' 'ERROR'
+        Set-RebootNeeded 'software ladder exhausted while calibration was accepted; manual sleep/wake required'
+    } else {
+        Write-Log 'Calibration could not be applied after the recovery ladder.' 'ERROR'
+        Set-RecalNeeded 'no usable stored calibration could be applied'
+    }
+    } finally {
+        Clear-Recovering
+        Exit-RecoveryCoordinator
+    }
 }
 
 # ---- logging ---------------------------------------------------------------
@@ -442,12 +543,6 @@ function Restart-RuntimeService {
         catch { Write-Log "Failed to restart '$($s.Name)': $($_.Exception.Message)" 'ERROR' }
     }
 }
-function Restart-MiddlewareService {
-    try { Write-Log "Restarting 'Tobii Service'..."
-          Restart-Service -Name 'Tobii Service' -Force -ErrorAction Stop
-          Write-Log "Restarted 'Tobii Service'." }
-    catch { Write-Log "Failed to restart 'Tobii Service': $($_.Exception.Message)" 'ERROR' }
-}
 function Restart-EyeXEngine {
     $p = Get-Process -Name 'Tobii.EyeX.Engine','Tobii.EyeX.Interaction' -ErrorAction SilentlyContinue
     if ($p) {
@@ -494,6 +589,7 @@ function Wait-ForTracking {
     $t0 = Get-Date
     $wfdSince = $null
     while (((Get-Date) - $t0).TotalSeconds -lt $TimeoutSec) {
+        Update-Heartbeat
         if (-not (Get-StackDownReason)) {
             $s = Get-TrackerStateStamped
             if ($s -and $s.Time -and $s.Time -gt $Since) {
@@ -511,25 +607,6 @@ function Wait-ForTracking {
     }
     return $false
 }
-function Reset-UsbDevice {
-    # Manual-only (aggressive). Verifies the device ends ENABLED (a bare
-    # restart-device can leave it in problem code 22 = disabled).
-    $dev = Get-PnpDevice -ErrorAction SilentlyContinue |
-             Where-Object { $_.InstanceId -match 'VID_2104' -and $_.Class -eq 'USBDevice' }
-    if (-not $dev) { Write-Log 'Tobii USB node (VID_2104) not found for power-cycle.' 'WARN'; return }
-    $pnputil = Join-Path $env:SystemRoot 'System32\pnputil.exe'
-    foreach ($d in $dev) {
-        Write-Log "Power-cycling USB device '$($d.FriendlyName)' via pnputil..."
-        try { & $pnputil /restart-device "$($d.InstanceId)" 2>&1 | Out-Null } catch {}
-        Start-Sleep -Seconds 2
-        $now = Get-PnpDevice -InstanceId $d.InstanceId -ErrorAction SilentlyContinue
-        if ($now -and $now.Status -ne 'OK') {
-            Write-Log "USB device status '$($now.Status)' after reset; forcing enable." 'WARN'
-            try { & $pnputil /enable-device "$($d.InstanceId)" 2>&1 | Out-Null } catch {}
-            try { Enable-PnpDevice -InstanceId $d.InstanceId -Confirm:$false -ErrorAction SilentlyContinue } catch {}
-        }
-    }
-}
 function Test-TrackerUsbHung {
     # True when the tracker is NOT cleanly on the bus: no VID_2104 node is OK+present.
     # In this state the engine sits in WaitingForDevice forever and service restarts
@@ -541,6 +618,21 @@ function Test-TrackerUsbHung {
     }
     return $true
 }
+function Get-TrackerUsbState {
+    # Tri-state wrapper: never equate a failed PnP query with an absent tracker.
+    try {
+        $nodes = @(Get-PnpDevice -ErrorAction Stop | Where-Object { $_.InstanceId -match 'VID_2104&PID_030C' })
+        foreach ($t in $nodes) {
+            $p = (Get-PnpDeviceProperty -InstanceId $t.InstanceId -KeyName 'DEVPKEY_Device_IsPresent' -ErrorAction Stop).Data
+            if ($t.Status -eq 'OK' -and $p) { return 'present' }
+        }
+        if ($nodes.Count -gt 0) { return 'faulted' }
+        return 'absent'
+    } catch {
+        Write-Log "PnP presence query failed: $($_.Exception.Message)" 'WARN'
+        return 'unknown'
+    }
+}
 function Reset-TrackerUsbNode {
     # SAFE, auto-runnable recovery for a tracker hung mid-enumeration. When the IS5
     # firmware wedges (e.g. after a hibernate/sleep resume) it can drop its real
@@ -551,8 +643,7 @@ function Reset-TrackerUsbNode {
     # descriptor-failed stand-in ON THE TRACKER'S OWN PORT (the connection locator is
     # read from the tracker's node at runtime -- never hardcoded), then rescans. It
     # touches ONLY the tracker's port, never the parent hub or the keyboard, and
-    # verifies the device ends ENABLED -- so it is safe to run automatically (unlike
-    # the blanket USB power-cycle we keep out of auto). Returns $true if a VID_2104
+    # verifies the device ends ENABLED. Returns $true if a VID_2104
     # node comes back OK + present. (Verified live 2026-07-09: recovered a device
     # that was fully off the bus, no reboot.)
     $pnputil = Join-Path $env:SystemRoot 'System32\pnputil.exe'
@@ -571,6 +662,7 @@ function Reset-TrackerUsbNode {
     $nodes = @(($trackerNodes + $failed) | Sort-Object -Property InstanceId -Unique)
     if (-not $nodes) { Write-Log 'Tracker USB node not found to port-cycle.' 'WARN'; return $false }
     foreach ($d in $nodes) {
+        Update-Heartbeat
         Write-Log ("Re-enumerating tracker port node ($($d.Status)): $($d.InstanceId)")
         try { Disable-PnpDevice -InstanceId $d.InstanceId -Confirm:$false -ErrorAction SilentlyContinue } catch {}
         Start-Sleep -Seconds 2
@@ -587,51 +679,80 @@ function Reset-TrackerUsbNode {
         elseif ($p -and $t.Status -ne 'OK') {
             try { & $pnputil /enable-device "$($t.InstanceId)" 2>&1 | Out-Null } catch {}
             try { Enable-PnpDevice -InstanceId $t.InstanceId -Confirm:$false -ErrorAction SilentlyContinue } catch {}
+            Start-Sleep -Seconds 1
+            $now = Get-PnpDevice -InstanceId $t.InstanceId -ErrorAction SilentlyContinue
+            $nowPresent = (Get-PnpDeviceProperty -InstanceId $t.InstanceId -KeyName 'DEVPKEY_Device_IsPresent' -ErrorAction SilentlyContinue).Data
+            if ($now -and $now.Status -eq 'OK' -and $nowPresent) { $ok = $true }
         }
     }
     Write-Log ("Tracker port re-enumeration: " + $(if ($ok) { 'device back OK/present.' } else { 'device still not enumerating.' }))
     return $ok
 }
-function Invoke-Recovery {
-    # AUTO recovery ladder -- no USB power-cycle (kept out of auto on purpose).
-    param([int]$Level)
+function Invoke-CleanStackRestart {
+    # Deterministic teardown prevents Tobii.Service from respawning the engine in
+    # the middle of recovery. Interaction starts only after fresh Tracking.
+    Set-RecoveryPhase -Phase 'clean-stack-restart'
     $t0 = Get-Date
-    if ($Level -le 1) { Restart-RuntimeService }
-    else { Restart-EyeXEngine; Restart-RuntimeService; Restart-MiddlewareService }
-    # ANY recovery that restarts the runtime service breaks the interaction<->engine
-    # PTP/warp binding: gaze comes back but the eyes-move-cursor warp stays dead until
-    # the interaction process re-binds. So bounce interaction after EVERY level (not
-    # just 2+), once a fresh Tracking returns, so the warp self-heals too.
-    Invoke-PostRecoveryInteractionReset -Since $t0
+    try { Stop-Service -Name 'Tobii Service' -Force -ErrorAction SilentlyContinue } catch {}
+    Restart-EyeXEngine
+    foreach ($s in Get-RuntimeServices) {
+        try { Stop-Service -Name $s.Name -Force -ErrorAction SilentlyContinue } catch {}
+    }
+    Start-Sleep -Seconds 2
+    foreach ($s in Get-RuntimeServices) {
+        try {
+            Write-Log "Starting runtime service '$($s.Name)'..."
+            Start-Service -Name $s.Name -ErrorAction Stop
+        } catch { Write-Log "Failed to start '$($s.Name)': $($_.Exception.Message)" 'ERROR' }
+    }
+    Start-Sleep -Seconds 2
+    try {
+        Write-Log "Starting 'Tobii Service'..."
+        Start-Service -Name 'Tobii Service' -ErrorAction Stop
+    } catch { Write-Log "Failed to start 'Tobii Service': $($_.Exception.Message)" 'ERROR' }
+    if (Wait-ForTracking -TimeoutSec 90 -Since $t0) {
+        Restart-InteractionProcess
+        return $true
+    }
+    Write-Log 'Clean stack restart did not reach fresh Tracking.' 'WARN'
+    return $false
+}
+function Invoke-Recovery {
+    # Bounded automatic recovery: one lightweight runtime restart, then callers
+    # escalate to the deterministic clean-stack transaction.
+    param([int]$Level)
+    if (-not (Enter-RecoveryCoordinator -Reason "recovery-level-$Level")) { return $false }
+    try {
+        $t0 = Get-Date
+        if ($Level -le 1) {
+            Set-RecoveryPhase -Phase 'runtime-restart'
+            Restart-RuntimeService
+            if (Wait-ForTracking -TimeoutSec 90 -Since $t0) {
+                Restart-InteractionProcess
+                return $true
+            }
+            return $false
+        }
+        return (Invoke-CleanStackRestart)
+    } finally { Exit-RecoveryCoordinator }
 }
 function Invoke-FullReconnect {
-    # MANUAL "fix it hard": tracker-port re-enumeration (recovers a descriptor-hung
-    # device that is off the bus) + USB power-cycle + full stack recycle.
-    Write-Log 'Full reconnect: tracker port re-enumeration + USB power-cycle + engine + services.'
-    $t0 = Get-Date
-    Reset-TrackerUsbNode | Out-Null
-    Reset-UsbDevice
-    Restart-EyeXEngine
-    Restart-RuntimeService
-    Restart-MiddlewareService
-    Invoke-PostRecoveryInteractionReset -Since $t0
-    # A full reconnect IS a clean re-enumeration: clear the degradation counter that
-    # arms the preventive at-lock reconnect.
-    $script:StallDegradationCount = 0
+    # One device re-enumeration followed by one clean stack restart. The old path
+    # re-enumerated the node and immediately issued a second USB restart.
+    if (-not (Enter-RecoveryCoordinator -Reason 'full-reconnect')) { return $false }
+    try {
+        Write-Log 'Full reconnect: one tracker-port re-enumeration + clean stack restart.'
+        Set-RecoveryPhase -Phase 'port-reenumeration'
+        $usbOk = Reset-TrackerUsbNode
+        if (-not $usbOk -and (Get-TrackerUsbState) -ne 'present') {
+            Write-Log 'Full reconnect could not restore USB presence.' 'WARN'
+            return $false
+        }
+        $ok = Invoke-CleanStackRestart
+        if ($ok) { $script:StallDegradationCount = 0 }
+        return $ok
+    } finally { Exit-RecoveryCoordinator }
 }
-function Invoke-PostRecoveryInteractionReset {
-    # After a full-stack restart the service respawns the interaction process
-    # BEFORE the engine reaches Tracking, and it can bind its PTP session dead
-    # (Mode E). Once the engine reports a fresh Tracking, bounce interaction so
-    # it binds against a live engine.
-    param([datetime]$Since)
-    if (Wait-ForTracking -TimeoutSec 90 -Since $Since) {
-        Restart-InteractionProcess
-    } else {
-        Write-Log 'Engine did not reach fresh Tracking within 90s; skipping interaction reset.' 'WARN'
-    }
-}
-
 # ---- one-shot modes --------------------------------------------------------
 if ($Once) {
     $s = Get-TrackerState
@@ -645,18 +766,27 @@ if ($Once) {
 }
 if ($ForceReconnect) {
     Write-Log 'Manual -ForceReconnect requested.'
-    Invoke-FullReconnect
+    if (Enter-RecoveryCoordinator -Reason 'manual-full-reconnect') {
+        try { Invoke-FullReconnect | Out-Null } finally { Exit-RecoveryCoordinator }
+    } else {
+        try { Set-Content -LiteralPath $RecoveryRequestFile -Value (Get-Date -Format 'o') -Encoding UTF8 } catch {}
+        Write-Log 'Manual full reconnect queued behind the active recovery.' 'WARN'
+    }
     Write-Log 'Done.'
     exit 0
 }
 if ($RestartInteraction) {
     Write-Log 'Manual -RestartInteraction requested (fix cursor warp).'
-    Restart-InteractionProcess
+    if (Enter-RecoveryCoordinator -Reason 'manual-fix-warp') {
+        try { Restart-InteractionProcess } finally { Exit-RecoveryCoordinator }
+    }
     Write-Log 'Done.'
     exit 0
 }
 if ($OnWake) {
     Write-Log 'Resume from sleep; checking state.'
+    if (-not (Enter-RecoveryCoordinator -Reason 'wake-check')) { exit 0 }
+    try {
     Start-Sleep -Seconds 6
     $s = Get-TrackerState
     $down = Get-StackDownReason
@@ -675,8 +805,16 @@ if ($OnWake) {
         $cpu = Get-EngineCpuPct -SampleSec 8
         if ($null -ne $cpu -and $cpu -lt $StallCpuPct -and (Get-ConsoleIdleSec) -le $StallIdleMaxSec) {
             Write-Log ("Resume: engine up but only ${cpu}% CPU (no calibration bound); re-applying stored calibration.") 'WARN'
-            if ((Invoke-CalReapply) -and (Test-GazeWorking)) {
-                Clear-RecalNeeded 'calibration re-applied on wake'
+            if (Invoke-CalReapply) {
+                $verify = Test-GazeWorking
+                if ($verify -eq 'healthy') {
+                    Clear-RecalNeeded 'calibration re-applied on wake'
+                } elseif ($verify -eq 'unknown') {
+                    Write-Log 'Wake calibration completed; pending user-present verification.' 'WARN'
+                } else {
+                    Write-Log 'Resume: re-apply did not restore healthy engine load; escalating.' 'WARN'
+                    Invoke-StallRecovery
+                }
             } else {
                 # Harder hibernate wake: the resume also tore down the engine's imaging
                 # session (IR LEDs fully off), so a bare re-apply cannot restore gaze --
@@ -691,6 +829,7 @@ if ($OnWake) {
             Write-Log ("Resume: state '$s', engine CPU $(if($null -ne $cpu){"${cpu}%"}else{'n/a'}); no action.")
         }
     } else { Write-Log "Resume: state '$(if($s){$s}else{'unknown'})'; no action." }
+    } finally { Exit-RecoveryCoordinator }
     exit 0
 }
 
@@ -707,7 +846,13 @@ $stallStrikes = 0; $lastStallCheck = Get-Date; $script:LastStallRecovery = $null
 $script:CooldownReconnectDone = $false; $script:JustResumed = $false
 $script:WasLocked = [bool](Get-Process -Name 'LogonUI' -ErrorAction SilentlyContinue)
 $script:StallDegradationCount = 0
+$script:HealthyCpuEwma = 12.0
+$script:LastVerifiedHealthy = $null
+$script:LastStallCpu = $null
+$script:LastHealthSampleCpu = $null
+$script:RecentFaults = @()
 Clear-Recovering   # never start with a stale recovering flag from a previous run
+Update-Heartbeat
 # Resume/transition detection: the loop polls every few seconds, so if wall-clock
 # jumps far more than that between iterations, the machine was suspended (sleep or
 # hibernate) or just came up -- detected WITHOUT relying on Windows' flaky resume
@@ -717,7 +862,15 @@ $lastLoopMark = Get-Date
 $burstUntil   = (Get-Date).AddSeconds($BurstSec)
 while ($true) {
     try {
+        Update-Heartbeat
         if ((++$iter % 60) -eq 0) { Rotate-Log }
+
+        if ((Test-Path -LiteralPath $RecoveryRequestFile) -and -not (Test-ConfigActive)) {
+            try { Remove-Item -LiteralPath $RecoveryRequestFile -Force -ErrorAction SilentlyContinue } catch {}
+            Write-Log 'Running queued manual full reconnect.' 'WARN'
+            Invoke-FullReconnect | Out-Null
+            $lastLoopMark = Get-Date
+        }
 
         if (Test-Path $PauseFlag) {
             if (-not $paused) { Write-Log "Paused (tray)."; $paused = $true; $level = 0; $unhealthySince = $null }
@@ -769,9 +922,7 @@ while ($true) {
                 -not (Get-StackDownReason) -and
                 -not (Test-TrackerUsbHung)) {
                 Write-Log ("Session lock with $($script:StallDegradationCount) degradation samples since last clean reset; preventive full reconnect while user is away.") 'WARN'
-                $tL = Get-Date
-                Invoke-FullReconnect
-                if (Wait-ForTracking -TimeoutSec 90 -Since $tL) { Invoke-CalReapply | Out-Null }
+                if (Invoke-FullReconnect) { Invoke-CalReapply | Out-Null }
                 $lastLoopMark = Get-Date  # long op; do not false-trigger the resume-gap check
             }
         }
@@ -796,10 +947,18 @@ while ($true) {
             $fault = "state '$s'"
         }
 
+        # Transient/setup/null states are not faults, but they are not positive
+        # recovery proof either. Never reset an active ladder merely because the
+        # engine moved from WaitingForDevice to Initialize/Configuring/unknown.
+        if (-not $fault -and ($stackDown -or -not ($HealthyStates -contains $s))) {
+            Update-Heartbeat
+            Start-Sleep -Seconds $PollSec
+            continue
+        }
+
         if (-not $fault) {
             if ($level -gt 0) { Write-Log "Recovered: state is now '$(if($s){$s}else{'unknown'})'." }
             $level = 0; $unhealthySince = $null
-            Clear-RebootNeeded 'tracker healthy again'
             Clear-Recovering
 
             # If the recal flag is up and the calibration file has been rewritten
@@ -820,12 +979,13 @@ while ($true) {
             # in ~15s instead of up to two minutes. Never while the calibration UI is open.
             $inBurst      = (Get-Date) -lt $burstUntil
             $checkEvery   = if ($inBurst) { $BurstStallCheckSec } else { $StallCheckEverySec }
-            $strikesToAct = if ($inBurst) { 1 } else { 2 }
             if ($s -eq 'Tracking' -and -not (Test-ConfigActive) -and
                 ((Get-Date) - $lastStallCheck).TotalSeconds -ge $checkEvery) {
                 $lastStallCheck = Get-Date
-                if (Test-SilentStall) {
+                $stallKind = Test-SilentStall
+                if ($stallKind) {
                     $stallStrikes++
+                    $strikesToAct = if ($stallKind -eq 'quiet') { $QuietStallStrikes } elseif ($inBurst) { 1 } else { 2 }
                     if ($stallStrikes -ge $strikesToAct) {
                         $stallStrikes = 0
                         # The first recovery right after a wake bypasses the anti-thrash
@@ -842,8 +1002,14 @@ while ($true) {
                     }
                 } else {
                     $stallStrikes = 0
+                    if ($script:LastHealthSampleCpu -ge (Get-DegradedCpuThreshold) -and
+                        (Get-TrackerUsbState) -eq 'present') {
+                        Clear-RebootNeeded 'USB present and engine load verified healthy'
+                    }
                 }
             }
+
+            if (-not $inBurst) { $script:JustResumed = $false }
 
             Start-Sleep -Seconds $PollSec
             continue
@@ -856,7 +1022,34 @@ while ($true) {
             continue
         }
 
-        if ($null -eq $unhealthySince) { $unhealthySince = Get-Date }
+        # A power-cycle-needed state is terminal and bounded. Do not keep creating
+        # recovery levels forever; wait quietly for the owner-initiated sleep/wake.
+        if (Test-Path -LiteralPath $RebootNeededFlag) {
+            $usbState = Get-TrackerUsbState
+            if ($usbState -eq 'present') {
+                Clear-RebootNeeded 'tracker returned after owner power cycle'
+                $level = 0; $unhealthySince = Get-Date
+            } else {
+                $script:RecoveryPhase = 'needs-manual-sleep'
+                Update-Heartbeat
+                Start-Sleep -Seconds 15
+                $lastLoopMark = Get-Date
+                continue
+            }
+        }
+
+        if ($null -eq $unhealthySince) {
+            $unhealthySince = Get-Date
+            $cutoff = (Get-Date).AddMinutes(-$ClusterWindowMin)
+            $script:RecentFaults = @($script:RecentFaults | Where-Object { $_ -gt $cutoff }) + (Get-Date)
+            $script:StallDegradationCount += 2
+            if ($script:RecentFaults.Count -ge $ClusterEscalateCount -and $level -eq 0) {
+                # Repeating a lightweight runtime restart that just failed twice is
+                # wasted outage time. Jump directly to the clean stack transaction.
+                $level = 1
+                Write-Log "$($script:RecentFaults.Count) faults inside ${ClusterWindowMin}m; skipping the lightweight rung." 'WARN'
+            }
+        }
         # During an active recovery episode (level > 0) the fault has already been
         # continuously confirmed; re-confirming for the full threshold between ladder
         # rungs just delays escalation. 10s is enough to debounce between rungs.
@@ -866,28 +1059,34 @@ while ($true) {
             continue
         }
 
-        $level++
+        $level = [Math]::Min($level + 1, 3)
         Write-Log ("Tracker fault ($fault) -> recovery level $level.") 'WARN'
         Set-Recovering
         # A stack-down fault needs the middleware service (re)started, which only
         # happens at level 2 of the ladder -- level 1 (runtime restart) can't help.
         if ($stackDown) {
             Invoke-Recovery -Level 2
-        } elseif ((Test-TrackerUsbHung) -or ($level -ge 3)) {
+        } elseif (((Get-TrackerUsbState) -in @('absent','faulted')) -or ($level -ge 3)) {
             # WaitingForDevice with the tracker NOT cleanly on the bus (descriptor
             # hang / fell off), or plain restarts have not cleared it. Re-enumerate
             # the tracker's OWN USB port (safe: only its port, verifies it ends
             # enabled). If that can't bring it back, it is a true firmware/hardware
-            # wedge that only a reboot clears -- flag it and stop thrashing.
+            # wedge that needs an owner-initiated S3 power cycle -- flag it and
+            # enter a bounded terminal state instead of continuing to thrash.
             if (Test-Path -LiteralPath $RebootNeededFlag) {
                 Write-Log 'Tracker off USB; reboot-needed already flagged -- waiting (no more port cycles).' 'WARN'
             } else {
                 Write-Log 'WaitingForDevice with tracker hung on USB; re-enumerating its port.' 'WARN'
-                if (Reset-TrackerUsbNode) {
-                    Restart-EyeXEngine; Restart-RuntimeService; Restart-MiddlewareService
+                if (Enter-RecoveryCoordinator -Reason 'usb-hang-recovery') {
+                  try {
+                  Set-RecoveryPhase -Phase 'port-reenumeration' -Reason 'USB hang'
+                  if (Reset-TrackerUsbNode) {
+                    Invoke-CleanStackRestart | Out-Null
                     Clear-RebootNeeded 'tracker port re-enumerated'
-                } elseif ($level -ge $UsbHangRebootLevel) {
-                    Set-RebootNeeded 'tracker fell off USB and a port re-enumeration could not recover it; sleep/wake the PC (cuts tracker power) or reboot'
+                  } elseif ($level -ge $UsbHangRebootLevel) {
+                    Set-RebootNeeded 'tracker fell off USB and port re-enumeration could not recover it; owner-initiated sleep/wake required'
+                  }
+                  } finally { Exit-RecoveryCoordinator }
                 }
             }
         } else {
