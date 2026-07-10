@@ -729,3 +729,18 @@ so it's redundant with this file.
   assuming silenced cmdlets ran. Also confirmed: `nhi` (Thunderbolt host-interface)
   errors that appear during rescans are a red herring — the idle TB controller waking
   into RTD3 when the scan pokes all buses, unrelated to the tracker's fabric.
+- **Session unlock — not just sleep — triggers the enumeration wedge; the watchdog
+  now bursts on unlock.** Decoding the Winlogon/Operational 811 notification codes
+  (2=logon, 3=logoff, 4=lock, 5=unlock) showed both hard USB wedges happened seconds
+  after a session *unlock*: one after a hibernate wake, and one on a machine that had
+  been awake the whole time — locked for 71 minutes running builds, tracker dead 28
+  seconds after unlock. Mechanism: at lock the Tobii runtime idles the tracker
+  (illuminators off, imaging session closed); at unlock it re-activates the device,
+  and that idle→reactivate power transition is what the IS5 firmware wedges on.
+  Sleep/hibernate is merely one way to produce the same edge. The catch for a
+  watchdog: lock/unlock produces **no clock gap and no Windows power event**, so
+  resume detection stays silent. Fix: the main loop watches for the lock screen via
+  the `LogonUI` process and, on the locked→unlocked edge, enters the same aggressive
+  burst window as a resume (fast checks, act on first strike). While locked it adds
+  nothing — the engine legitimately idles there, and the stall detector already
+  requires user activity before acting.

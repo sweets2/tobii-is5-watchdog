@@ -667,6 +667,7 @@ Write-Log "Tobii watchdog (log-state + stack-presence + silent-stall) started. t
 $level = 0; $unhealthySince = $null; $iter = 0; $paused = $false
 $stallStrikes = 0; $lastStallCheck = Get-Date; $script:LastStallRecovery = $null
 $script:CooldownReconnectDone = $false; $script:JustResumed = $false
+$script:WasLocked = [bool](Get-Process -Name 'LogonUI' -ErrorAction SilentlyContinue)
 # Resume/transition detection: the loop polls every few seconds, so if wall-clock
 # jumps far more than that between iterations, the machine was suspended (sleep or
 # hibernate) or just came up -- detected WITHOUT relying on Windows' flaky resume
@@ -699,6 +700,23 @@ while ($true) {
             $stallStrikes = 0
             $script:JustResumed = $true
         }
+
+        # Session-unlock detection: a lock/unlock produces NO clock gap and NO Windows
+        # power event, yet unlock is when the Tobii runtime re-activates the idled
+        # tracker -- the transition the IS5 firmware wedges on (proven 2026-07-10:
+        # 71 min locked -> unlock -> descriptor-hang 28s later). The lock screen is
+        # visible as the LogonUI process; on the locked->unlocked edge run the same
+        # aggressive burst as a resume. While locked, do nothing extra: the engine
+        # legitimately idles and the stall detector already requires user activity.
+        $lockedNow = [bool](Get-Process -Name 'LogonUI' -ErrorAction SilentlyContinue)
+        if ($script:WasLocked -and -not $lockedNow) {
+            Write-Log ("Session unlock detected; aggressive recheck for ${BurstSec}s.") 'WARN'
+            $burstUntil = (Get-Date).AddSeconds($BurstSec)
+            $lastStallCheck = [DateTime]::MinValue
+            $stallStrikes = 0
+            $script:JustResumed = $true
+        }
+        $script:WasLocked = $lockedNow
 
         $s = Get-TrackerState
         $stackDown = Get-StackDownReason
