@@ -759,3 +759,22 @@ so it's redundant with this file.
   down, or a reboot is pending. Caveat if you use Windows Hello face login: the
   reconnect makes the camera briefly unavailable at the start of a lock — check
   `WbioSrvc` before enabling this pattern on a Hello machine.
+- **A ~10-second sleep/wake revives a descriptor-hung tracker — no reboot needed.**
+  The definitive diagnosis came from dropping below the (reboot-pending-poisoned) PnP
+  layer entirely: opening the hub's device interface directly
+  (`\\?\USB#ROOT_HUB30#...#{f18a0e88-c30c-11d0-8815-00a0c906bed8}` — this works even
+  when the hub's devnode has been deferred-removed, and even without elevation) and
+  issuing `IOCTL_USB_GET_NODE_CONNECTION_INFORMATION_EX` per port. That returns the
+  *electrical* truth of the bus, independent of every devnode: the wedged tracker's
+  port read **NoDevice** — the hung MCU stops asserting bus presence entirely, which
+  is why no software path (PnP, pnputil, or `IOCTL_USB_HUB_CYCLE_PORT`, which fails
+  with win32 error 433 on an electrically empty port) can reach it. Caution: devnode
+  locator numbers did NOT match electrical ports (phantom devnodes claimed ports the
+  survey showed empty) — trust the survey, not the instance IDs. The fix: S3 sleep
+  cuts the tracker's power rail on this laptop, so a ~10s sleep/wake reboots the
+  tracker's firmware; it re-asserted presence, the devnode re-created itself, and the
+  watchdog's on-wake handler restored the stack, calibration and warp automatically.
+  Session, terminals and running builds all survive — vastly cheaper than the full
+  shutdown previously believed necessary. The tray's terminal notification now says
+  SLEEP/WAKE instead of REBOOT. Survey/cycle tool: `CyclePort.ps1` (hub instance ID
+  inside is machine-specific — adjust for your hub).

@@ -111,7 +111,7 @@ function Apply-State {
 
     $rebootNeeded = Test-Path $RebootFlag
     $recalNeeded  = Test-Path $RecalFlag
-    if ($rebootNeeded)              { $ni.Icon = $icoRecal;  $txt = 'REBOOT NEEDED (tracker off USB)' }
+    if ($rebootNeeded)              { $ni.Icon = $icoRecal;  $txt = 'SLEEP/WAKE NEEDED (tracker off USB)' }
     elseif ($recalNeeded)           { $ni.Icon = $icoRecal;  $txt = 'RECALIBRATION NEEDED' }
     elseif ($state.mode -eq 'paused') { $ni.Icon = $icoPaused; $txt = 'Paused (manual)' }
     elseif ($gameActive)            { $ni.Icon = $icoGame;   $txt = 'Auto-paused (game)' }
@@ -122,14 +122,15 @@ function Apply-State {
     $miToggle.Text = if ($state.mode -eq 'paused') { 'Resume auto-recovery' } else { 'Pause auto-recovery' }
     $miAuto.Checked = [bool]$state.autoGames
 
-    # Reboot-needed: the watchdog tried everything, incl. re-enumerating the tracker's
-    # USB port, and the device is still off the bus = a firmware/hardware wedge only a
-    # reboot clears. Higher priority than recal. Nag once, then every 5 minutes.
+    # Reboot/sleep-needed: the watchdog tried everything, incl. re-enumerating the
+    # tracker's USB port, and the device is still off the bus = a firmware wedge that
+    # only POWER REMOVAL clears. A ~10s sleep/wake does it (S3 cuts the tracker rail;
+    # proven 2026-07-10) - no reboot required. Nag once, then every 5 minutes.
     if ($rebootNeeded) {
         if (((Get-Date) - $script:lastRebootNag).TotalMinutes -ge 5) {
             $script:lastRebootNag = Get-Date
-            $ni.ShowBalloonTip(15000, 'Tobii: reboot needed',
-                'The eye tracker dropped off the USB bus and auto-recovery (including a port re-enumeration) could not bring it back. A reboot is required to restore eye tracking.',
+            $ni.ShowBalloonTip(15000, 'Tobii: sleep/wake needed',
+                'The eye tracker dropped off the USB bus and auto-recovery could not bring it back. FIX: put the PC to SLEEP for ~10s, then wake it - sleep cuts the tracker power rail and reboots its firmware (proven 2026-07-10). Full shutdown also works.',
                 [System.Windows.Forms.ToolTipIcon]::Warning)
         }
     } else {

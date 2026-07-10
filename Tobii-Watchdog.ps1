@@ -850,7 +850,7 @@ while ($true) {
                     Restart-EyeXEngine; Restart-RuntimeService; Restart-MiddlewareService
                     Clear-RebootNeeded 'tracker port re-enumerated'
                 } elseif ($level -ge $UsbHangRebootLevel) {
-                    Set-RebootNeeded 'tracker fell off USB and a port re-enumeration could not recover it; a reboot is required'
+                    Set-RebootNeeded 'tracker fell off USB and a port re-enumeration could not recover it; sleep/wake the PC (cuts tracker power) or reboot'
                 }
             }
         } else {
