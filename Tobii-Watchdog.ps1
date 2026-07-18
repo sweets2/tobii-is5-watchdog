@@ -866,9 +866,17 @@ if ($OnWake) {
     Start-Sleep -Seconds 6
     $s = Get-TrackerState
     $down = Get-StackDownReason
+    $usbState = Get-TrackerUsbState
     $softwareFault = Get-TobiiSoftwareDeviceFault
     if (Test-ConfigActive) {
         Write-Log 'Resume: calibration/config UI active; no action.'
+    } elseif ($usbState -in @('absent','faulted')) {
+        Write-Log ("Resume: EyeChip USB $usbState; running full reconnect immediately.") 'WARN'
+        if (Invoke-FullReconnect) {
+            Clear-RebootNeeded 'wake full reconnect restored USB and tracking'
+        } else {
+            Set-RebootNeeded 'wake full reconnect could not restore EyeChip USB presence'
+        }
     } elseif ($softwareFault) {
         Write-Log ("Resume: $softwareFault; rebuilding the stack.") 'WARN'; Invoke-Recovery -Level 2
     } elseif ($down -and -not (Test-InBootGrace)) {

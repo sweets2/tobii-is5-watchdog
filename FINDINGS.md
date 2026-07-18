@@ -857,3 +857,10 @@ so it's redundant with this file.
   additional retry only while that exact descriptor node remains present; otherwise
   it stops safely, clears the active-recovery flag, and requires owner-initiated
   power removal.
+- **2026-07-18 - wake recovery now checks USB before engine CPU.** After the owner
+  slept the machine, the tracker remained a reachable Code 43 node. The old wake
+  path saw stale `Tracking` plus 0% engine CPU and spent over three minutes on
+  calibration reapply and a clean-stack timeout before eventually reaching the USB
+  full reconnect, which restored EyeChip and 14.4% engine activity. `-OnWake` now
+  checks tri-state EyeChip USB status first and immediately runs the complete
+  reconnect for `absent`/`faulted`, while preserving the config-UI safety guard.
