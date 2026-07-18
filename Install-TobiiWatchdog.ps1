@@ -38,6 +38,19 @@ Assert-Admin
 
 $watchdog = Join-Path $ScriptDir 'Tobii-Watchdog.ps1'
 if (-not (Test-Path $watchdog)) { throw "Cannot find $watchdog" }
+$hiddenRunner = Join-Path $ScriptDir 'Tobii-RunHidden.vbs'
+if (-not (Test-Path $hiddenRunner)) { throw "Cannot find $hiddenRunner" }
+$wscriptExe = Join-Path $env:SystemRoot 'System32\wscript.exe'
+
+function New-HiddenPowerShellTaskAction {
+    param(
+        [Parameter(Mandatory)][string]$ScriptName,
+        [string]$ScriptArguments = ''
+    )
+    $runnerArgs = "`"$hiddenRunner`" `"$ScriptName`""
+    if ($ScriptArguments) { $runnerArgs += " $ScriptArguments" }
+    New-ScheduledTaskAction -Execute $wscriptExe -Argument $runnerArgs
+}
 
 Write-Host "== 1. Disabling USB power-saving for the Tobii device ==" -ForegroundColor Cyan
 
@@ -97,10 +110,9 @@ Write-Host "== 2. Registering scheduled task 'TobiiWatchdog' ==" -ForegroundColo
 $taskName = 'TobiiWatchdog'
 Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
 
-# Passive log-state watchdog: no SDK, runs in normal (64-bit) PowerShell.
-$psExe = 'powershell.exe'
-$action = New-ScheduledTaskAction -Execute $psExe `
-    -Argument "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$watchdog`""
+# WScript creates no console window. PowerShell's -WindowStyle Hidden is too late:
+# conhost can briefly appear and steal focus before PowerShell processes that flag.
+$action = New-HiddenPowerShellTaskAction -ScriptName 'Tobii-Watchdog.ps1'
 
 # Run at logon of the current (interactive) user, with highest privileges so
 # service restarts / USB power-cycles work. Running as the user (not SYSTEM)
@@ -122,8 +134,7 @@ Write-Host "== 2b. Registering wake task 'TobiiWatchdog-OnWake' ==" -ForegroundC
 $wakeName = 'TobiiWatchdog-OnWake'
 Unregister-ScheduledTask -TaskName $wakeName -Confirm:$false -ErrorAction SilentlyContinue
 
-$wakeAction = New-ScheduledTaskAction -Execute $psExe `
-    -Argument "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$watchdog`" -OnWake"
+$wakeAction = New-HiddenPowerShellTaskAction -ScriptName 'Tobii-Watchdog.ps1' -ScriptArguments '-OnWake'
 
 # Fire on resume-from-sleep: System log, Power-Troubleshooter event ID 1
 # ("the system has returned from a low power state").
@@ -144,8 +155,7 @@ Write-Host "   registered '$wakeName' (fires on resume from sleep, elevated)."
 Write-Host "== 2d. Registering on-demand 'TobiiReconnect' task (tray button) ==" -ForegroundColor Cyan
 $rcName = 'TobiiReconnect'
 Unregister-ScheduledTask -TaskName $rcName -Confirm:$false -ErrorAction SilentlyContinue
-$rcAction = New-ScheduledTaskAction -Execute $psExe `
-    -Argument "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$watchdog`" -ForceReconnect"
+$rcAction = New-HiddenPowerShellTaskAction -ScriptName 'Tobii-Watchdog.ps1' -ScriptArguments '-ForceReconnect'
 $rcSettings = New-ScheduledTaskSettingsSet -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Minutes 5) -MultipleInstances IgnoreNew
 # No trigger: it only runs when started on demand (by the tray). Runs elevated,
 # so the non-admin tray can trigger a privileged reconnect without a UAC prompt.
@@ -157,8 +167,7 @@ Write-Host "   registered '$rcName' (on-demand, elevated)."
 Write-Host "== 2d2. Registering on-demand 'TobiiFixWarp' task (tray button) ==" -ForegroundColor Cyan
 $fwName = 'TobiiFixWarp'
 Unregister-ScheduledTask -TaskName $fwName -Confirm:$false -ErrorAction SilentlyContinue
-$fwAction = New-ScheduledTaskAction -Execute $psExe `
-    -Argument "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$watchdog`" -RestartInteraction"
+$fwAction = New-HiddenPowerShellTaskAction -ScriptName 'Tobii-Watchdog.ps1' -ScriptArguments '-RestartInteraction'
 $fwSettings = New-ScheduledTaskSettingsSet -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Minutes 5) -MultipleInstances IgnoreNew
 # No trigger: on-demand only (tray "Fix cursor warp"). Restarts the interaction
 # process to re-bind its PTP session (Mode E: gaze fine, cursor warp dead).
@@ -172,8 +181,7 @@ $monitor = Join-Path $ScriptDir 'Tobii-Monitor.ps1'
 $monName = 'TobiiMonitor'
 if (Test-Path $monitor) {
     Unregister-ScheduledTask -TaskName $monName -Confirm:$false -ErrorAction SilentlyContinue
-    $monAction = New-ScheduledTaskAction -Execute $psExe `
-        -Argument "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$monitor`""
+    $monAction = New-HiddenPowerShellTaskAction -ScriptName 'Tobii-Monitor.ps1'
     $monTrigger   = New-ScheduledTaskTrigger -AtLogOn -User $user
     # Non-elevated (Limited): it only reads state, never touches the device.
     $monPrincipal = New-ScheduledTaskPrincipal -UserId $user -LogonType Interactive -RunLevel Limited
@@ -194,8 +202,7 @@ $sentinel = Join-Path $ScriptDir 'Tobii-Sentinel.ps1'
 $sentinelName = 'TobiiSentinel'
 if (Test-Path $sentinel) {
     Unregister-ScheduledTask -TaskName $sentinelName -Confirm:$false -ErrorAction SilentlyContinue
-    $sentinelAction = New-ScheduledTaskAction -Execute $psExe `
-        -Argument "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$sentinel`""
+    $sentinelAction = New-HiddenPowerShellTaskAction -ScriptName 'Tobii-Sentinel.ps1'
     $sentinelTrigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) `
         -RepetitionInterval (New-TimeSpan -Minutes 1) -RepetitionDuration (New-TimeSpan -Days 3650)
     $sentinelSettings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `

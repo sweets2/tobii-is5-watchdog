@@ -839,3 +839,9 @@ so it's redundant with this file.
   client cleanup, and Interaction rebind restored 10.3% engine activity. The full
   reconnect command now performs that complete transaction and verifies engine load
   when the user is active, without opening a raw gaze stream.
+- **2026-07-18 - eliminated scheduled-task console flashes.** `powershell.exe
+  -WindowStyle Hidden` still creates a console before PowerShell processes the
+  flag, so the one-minute sentinel could briefly steal foreground focus. All six
+  scheduled actions now run through `wscript.exe` and `Tobii-RunHidden.vbs` with
+  window style 0. The wrapper waits for its PowerShell child, preserving Task
+  Scheduler running state, overlap prevention, timeout, and restart behavior.

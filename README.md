@@ -37,7 +37,7 @@ Full evidence, quantified logs, and the five distinct failure modes (A–E) are 
 | `Tobii-Monitor.ps1` | Passive telemetry recorder (observe-only): logs typed incidents/recoveries + snapshots, watchdog recovery phase, and gap-aware statistics. |
 | `Tobii-Sentinel.ps1` | Supervises the watchdog and telemetry heartbeat files and restarts those processes if they hang. It never touches the Tobii stack or machine power. |
 | `Tobii-CalReapply.cs` → `.exe` | The **Mode-D fix**: re-pushes the tracker's *stored* calibration to the live engine after a hibernate-resume — **no restart, no recalibration dots**. Uses the safe engine-IPC path (`Tobii.Interaction`), never a raw gaze stream. Compiled by the installer with the built-in .NET compiler. |
-| `Install-TobiiWatchdog.ps1` | Registers the scheduled tasks + tray autostart, disables USB selective suspend for the device, and builds `Tobii-CalReapply.exe`. |
+| `Install-TobiiWatchdog.ps1` | Registers no-console scheduled tasks through `Tobii-RunHidden.vbs`, configures tray autostart, disables USB selective suspend, and builds `Tobii-CalReapply.exe`. |
 | `Uninstall-TobiiWatchdog.ps1` | Removes everything. |
 
 ## Install
