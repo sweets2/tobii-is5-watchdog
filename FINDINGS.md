@@ -855,4 +855,5 @@ so it's redundant with this file.
   Recovery now detects Code 10 directly and performs a bounded second USB pass when
   the first pass creates the matching Code 43 node. A terminal flag permits one
   additional retry only while that exact descriptor node remains present; otherwise
-  it still stops safely and requires owner-initiated power removal.
+  it stops safely, clears the active-recovery flag, and requires owner-initiated
+  power removal.

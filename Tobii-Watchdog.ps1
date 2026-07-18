@@ -295,6 +295,8 @@ function Set-RebootNeeded {
         Write-Log ("Raising MANUAL-SLEEP-needed flag: $Reason") 'ERROR'
         try { Set-Content -LiteralPath $RebootNeededFlag -Value ("{0} {1}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $Reason) } catch { }
     }
+    # Terminal manual-sleep is not active recovery; keep tray/heartbeat truthful.
+    Clear-Recovering
 }
 function Clear-RebootNeeded {
     param([string]$Why = '')
