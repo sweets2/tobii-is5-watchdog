@@ -33,7 +33,7 @@ Full evidence, quantified logs, and the five distinct failure modes (A–E) are 
 | Component | Role |
 |---|---|
 | `Tobii-Watchdog.ps1` | Passive watchdog. Reads the engine log and process load (never the gaze stream), serializes every recovery request through one coordinator, and runs a bounded recovery state machine. It learns a healthy CPU baseline and catches both near-zero and 4–6% half-alive stalls, including a conservative quiet-user path. |
-| `Tobii-Tray.ps1` / `.vbs` | System-tray app: **Reconnect now**, **Fix cursor warp**, **Recalibrate now**, manual **Sleep/wake tracker**, Pause/Resume, Health report, and Recent disconnects. Shows recovery phase and a gray offline state when the watchdog heartbeat is stale. |
+| `Tobii-Tray.ps1` / `.vbs` | System-tray app: **Reconnect now**, **Fix cursor warp**, **Recalibrate now**, manual **Sleep/wake tracker**, Pause/Resume, Health report, and Recent disconnects. Green now requires an OK, present EyeChip; blue reports a missing device or active recovery, and gray reports a stale watchdog heartbeat. |
 | `Tobii-Monitor.ps1` | Passive telemetry recorder (observe-only): logs typed incidents/recoveries + snapshots, watchdog recovery phase, and gap-aware statistics. |
 | `Tobii-Sentinel.ps1` | Supervises the watchdog and telemetry heartbeat files and restarts those processes if they hang. It never touches the Tobii stack or machine power. |
 | `Tobii-CalReapply.cs` → `.exe` | The **Mode-D fix**: re-pushes the tracker's *stored* calibration to the live engine after a hibernate-resume — **no restart, no recalibration dots**. Uses the safe engine-IPC path (`Tobii.Interaction`), never a raw gaze stream. Compiled by the installer with the built-in .NET compiler. |
@@ -74,6 +74,11 @@ Uninstall: `powershell -ExecutionPolicy Bypass -File "C:\Scripts\Uninstall-Tobii
   watchdog stops thrashing and raises a **manual sleep/wake needed** notification.
   On this machine a short owner-initiated S3 cycle restores the electrically absent
   tracker; the watchdog never sleeps or reboots the PC itself.
+- **Catches descriptor failures even when EyeX says `unknown`.** USB presence is
+  checked independently on every loop. A live `VID_0000&PID_0002` Code 43 node is
+  matched to the EyeChip by PnP parent and location, then restarted with
+  `pnputil /restart-device`; the stale serial-number EyeChip node is not mistaken
+  for a USB connection locator.
 - **Auto-recovers a dead stack** — if the Tobii service or engine process is
   missing (crash, or a cold boot after the battery died in sleep), that's a fault
   too, with a post-boot grace so it never fights the service's delayed autostart.

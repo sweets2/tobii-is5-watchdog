@@ -150,6 +150,15 @@ function Update-Heartbeat {
 function Test-ConfigActive {
     [bool](Get-Process -Name 'Tobii.Configuration' -ErrorAction SilentlyContinue)
 }
+function Stop-StaleDiagnosticClients {
+    # These clients can retain a dead EyeX session after an engine restart. Close
+    # them only inside a confirmed full reconnect; normal monitoring never does.
+    $clients = @(Get-Process -Name 'Tobii.EyeTracking.Portal.WPF','GazeNative8' -ErrorAction SilentlyContinue)
+    if ($clients.Count -gt 0) {
+        Write-Log ("Closing stale Tobii diagnostic clients: " + (($clients | ForEach-Object { "$($_.ProcessName):$($_.Id)" }) -join ', '))
+        $clients | Stop-Process -Force -ErrorAction SilentlyContinue
+    }
+}
 
 # Passive stack-presence check (Get-Service/Get-Process only -- never the gaze
 # stream). Returns a reason string when the middleware service or the engine
@@ -635,43 +644,45 @@ function Get-TrackerUsbState {
 }
 function Reset-TrackerUsbNode {
     # SAFE, auto-runnable recovery for a tracker hung mid-enumeration. When the IS5
-    # firmware wedges (e.g. after a hibernate/sleep resume) it can drop its real
-    # identity (VID_2104&PID_030C) and re-appear as a generic "Device Descriptor
-    # Request Failed" node (VID_0000&PID_0002) on the SAME hub port -- so Reset-
-    # UsbDevice (which matches VID_2104) never finds it and the service-restart
-    # ladder thrashes forever. This cycles BOTH the real tracker node(s) AND any
-    # descriptor-failed stand-in ON THE TRACKER'S OWN PORT (the connection locator is
-    # read from the tracker's node at runtime -- never hardcoded), then rescans. It
-    # touches ONLY the tracker's port, never the parent hub or the keyboard, and
-    # verifies the device ends ENABLED. Returns $true if a VID_2104
-    # node comes back OK + present. (Verified live 2026-07-09: recovered a device
-    # that was fully off the bus, no reboot.)
+    # firmware wedges it can drop its real identity (VID_2104&PID_030C) and appear
+    # as a generic descriptor-failed node (VID_0000&PID_0002). Restart that live
+    # stand-in on the tracker's own port, matched by PnP parent and location; if no
+    # stand-in is live, restart the real tracker node. Never touch the parent hub.
     $pnputil = Join-Path $env:SystemRoot 'System32\pnputil.exe'
     $trackerNodes = @(Get-PnpDevice -ErrorAction SilentlyContinue | Where-Object { $_.InstanceId -match 'VID_2104&PID_030C' })
-    # the USB connection locator (e.g. '5&1a2b3c&0&9') pins the exact hub port
-    $loc = $null
+
+    # EyeChip uses a serial-number instance ID, not a USB connection locator.
+    $trackerParents = @()
+    $trackerLocations = @()
     foreach ($t in $trackerNodes) {
-        $seg = ($t.InstanceId -split '\\')[-1]
-        if ($seg -match '&\d+&\d+$') { $loc = $seg; break }
+        $parent = (Get-PnpDeviceProperty -InstanceId $t.InstanceId -KeyName 'DEVPKEY_Device_Parent' -ErrorAction SilentlyContinue).Data
+        $location = (Get-PnpDeviceProperty -InstanceId $t.InstanceId -KeyName 'DEVPKEY_Device_LocationInfo' -ErrorAction SilentlyContinue).Data
+        if ($parent) { $trackerParents += $parent }
+        if ($location) { $trackerLocations += $location }
     }
-    $failed = @()
-    if ($loc) {
-        $failed = @(Get-PnpDevice -ErrorAction SilentlyContinue | Where-Object {
-            $_.InstanceId -match 'VID_0000&PID_0002' -and (($_.InstanceId -split '\\')[-1] -eq $loc) })
-    }
-    $nodes = @(($trackerNodes + $failed) | Sort-Object -Property InstanceId -Unique)
+
+    $failed = @(Get-PnpDevice -ErrorAction SilentlyContinue | Where-Object {
+        if ($_.InstanceId -notmatch 'VID_0000&PID_0002') { return $false }
+        $present = (Get-PnpDeviceProperty -InstanceId $_.InstanceId -KeyName 'DEVPKEY_Device_IsPresent' -ErrorAction SilentlyContinue).Data
+        if (-not $present) { return $false }
+        $parent = (Get-PnpDeviceProperty -InstanceId $_.InstanceId -KeyName 'DEVPKEY_Device_Parent' -ErrorAction SilentlyContinue).Data
+        $location = (Get-PnpDeviceProperty -InstanceId $_.InstanceId -KeyName 'DEVPKEY_Device_LocationInfo' -ErrorAction SilentlyContinue).Data
+        return ($trackerParents -contains $parent) -and ($trackerLocations -contains $location)
+    })
+
+    # Restarting the live descriptor-failed node clears Code 43. Cycling only a
+    # stale EyeChip node leaves the physical port failure untouched.
+    $nodes = if ($failed.Count -gt 0) { @($failed) } else { @($trackerNodes) }
     if (-not $nodes) { Write-Log 'Tracker USB node not found to port-cycle.' 'WARN'; return $false }
     foreach ($d in $nodes) {
         Update-Heartbeat
         Write-Log ("Re-enumerating tracker port node ($($d.Status)): $($d.InstanceId)")
-        try { Disable-PnpDevice -InstanceId $d.InstanceId -Confirm:$false -ErrorAction SilentlyContinue } catch {}
-        Start-Sleep -Seconds 2
-        try { Enable-PnpDevice -InstanceId $d.InstanceId -Confirm:$false -ErrorAction SilentlyContinue } catch {}
-        Start-Sleep -Seconds 2
+        try { & $pnputil /restart-device "$($d.InstanceId)" 2>&1 | Out-Null } catch {}
+        Start-Sleep -Seconds 3
     }
     try { & $pnputil /scan-devices 2>&1 | Out-Null } catch {}
     Start-Sleep -Seconds 4
-    # verify + force-enable anything that came back present-but-not-OK (avoid code 22)
+
     $ok = $false
     foreach ($t in @(Get-PnpDevice -ErrorAction SilentlyContinue | Where-Object { $_.InstanceId -match 'VID_2104&PID_030C' })) {
         $p = (Get-PnpDeviceProperty -InstanceId $t.InstanceId -KeyName 'DEVPKEY_Device_IsPresent' -ErrorAction SilentlyContinue).Data
@@ -737,11 +748,13 @@ function Invoke-Recovery {
     } finally { Exit-RecoveryCoordinator }
 }
 function Invoke-FullReconnect {
-    # One device re-enumeration followed by one clean stack restart. The old path
-    # re-enumerated the node and immediately issued a second USB restart.
+    # Complete recovery transaction: restore the USB node, rebuild the stack,
+    # reapply stored calibration, discard stale diagnostic sessions, and rebind
+    # Interaction. Verification remains passive (engine load), never a gaze stream.
     if (-not (Enter-RecoveryCoordinator -Reason 'full-reconnect')) { return $false }
     try {
-        Write-Log 'Full reconnect: one tracker-port re-enumeration + clean stack restart.'
+        Write-Log 'Full reconnect: tracker port + clean stack + calibration + Interaction rebind.'
+        Stop-StaleDiagnosticClients
         Set-RecoveryPhase -Phase 'port-reenumeration'
         $usbOk = Reset-TrackerUsbNode
         if (-not $usbOk -and (Get-TrackerUsbState) -ne 'present') {
@@ -749,20 +762,38 @@ function Invoke-FullReconnect {
             return $false
         }
         $ok = Invoke-CleanStackRestart
-        if ($ok) { $script:StallDegradationCount = 0 }
-        return $ok
+        if (-not $ok) { return $false }
+
+        Set-RecoveryPhase -Phase 'calibration-reapply'
+        $calOk = Invoke-CalReapply
+        Restart-InteractionProcess
+        if (-not $calOk) {
+            Write-Log 'Full reconnect restored the stack but calibration re-apply failed.' 'WARN'
+        }
+
+        if ((Get-ConsoleIdleSec) -le $StallIdleMaxSec) {
+            $verify = Test-GazeWorking
+            if ($verify -eq 'unhealthy') {
+                Write-Log 'Full reconnect completed, but engine load still indicates stalled gaze processing.' 'WARN'
+                return $false
+            }
+        }
+        $script:StallDegradationCount = 0
+        return $true
     } finally { Exit-RecoveryCoordinator }
 }
 # ---- one-shot modes --------------------------------------------------------
 if ($Once) {
     $s = Get-TrackerState
     $down = Get-StackDownReason
+    $usbState = Get-TrackerUsbState
     Write-Log ("Stack=$(if($down){'DOWN: '+$down}else{'up'})  bootGrace=$(Test-InBootGrace)")
+    Write-Log ("USB=$usbState")
     if (-not $s) { Write-Log "Could not read tracker state." 'WARN'; exit 1 }
     Write-Log ("State=$s  healthy=$([bool]($HealthyStates -contains $s))  trusted=$(-not $down)")
     $cpu = Get-EngineCpuPct -SampleSec 5
     Write-Log ("EngineCPU=$(if($null -ne $cpu){"${cpu}%"}else{'n/a'})  consoleIdle=$(Get-ConsoleIdleSec)s  recalFlag=$([bool](Test-Path -LiteralPath $RecalFlag))")
-    exit 0
+    exit $(if ($usbState -in @('absent','faulted')) { 2 } else { 0 })
 }
 if ($ForceReconnect) {
     Write-Log 'Manual -ForceReconnect requested.'
@@ -930,18 +961,14 @@ while ($true) {
 
         $s = Get-TrackerState
         $stackDown = Get-StackDownReason
+        $usbState = Get-TrackerUsbState
 
-        # Two fault classes:
-        #  1) Stack down (service stopped / engine gone). The log state is stale
-        #     here -- after a crash or cold boot it still says 'Tracking' from the
-        #     previous session -- so it is ignored. Post-boot grace applies
-        #     because 'Tobii Service' is delayed-start.
-        #  2) Engine alive and reporting WaitingForDevice (the PRP-drop
-        #     signature). Only this state is a fault; Tracking, Idle, null and
-        #     all transient/setup states (incl. Configuring = calibration) are
-        #     left alone.
+        # USB state is authoritative even when the EyeX log is stale or reports
+        # no state. This catches a live Code 43 descriptor failure immediately.
         $fault = $null
-        if ($stackDown) {
+        if ($usbState -in @('absent','faulted')) {
+            $fault = "EyeChip USB $usbState"
+        } elseif ($stackDown) {
             if (-not (Test-InBootGrace)) { $fault = $stackDown }
         } elseif ($FaultStates -contains $s) {
             $fault = "state '$s'"
@@ -1062,11 +1089,7 @@ while ($true) {
         $level = [Math]::Min($level + 1, 3)
         Write-Log ("Tracker fault ($fault) -> recovery level $level.") 'WARN'
         Set-Recovering
-        # A stack-down fault needs the middleware service (re)started, which only
-        # happens at level 2 of the ladder -- level 1 (runtime restart) can't help.
-        if ($stackDown) {
-            Invoke-Recovery -Level 2
-        } elseif (((Get-TrackerUsbState) -in @('absent','faulted')) -or ($level -ge 3)) {
+        if (($usbState -in @('absent','faulted')) -or ($level -ge 3)) {
             # WaitingForDevice with the tracker NOT cleanly on the bus (descriptor
             # hang / fell off), or plain restarts have not cleared it. Re-enumerate
             # the tracker's OWN USB port (safe: only its port, verifies it ends
@@ -1076,7 +1099,7 @@ while ($true) {
             if (Test-Path -LiteralPath $RebootNeededFlag) {
                 Write-Log 'Tracker off USB; reboot-needed already flagged -- waiting (no more port cycles).' 'WARN'
             } else {
-                Write-Log 'WaitingForDevice with tracker hung on USB; re-enumerating its port.' 'WARN'
+                Write-Log 'Tracker hung on USB; re-enumerating its port.' 'WARN'
                 if (Enter-RecoveryCoordinator -Reason 'usb-hang-recovery') {
                   try {
                   Set-RecoveryPhase -Phase 'port-reenumeration' -Reason 'USB hang'
@@ -1089,6 +1112,9 @@ while ($true) {
                   } finally { Exit-RecoveryCoordinator }
                 }
             }
+        # A stack-down fault needs both middleware services restarted.
+        } elseif ($stackDown) {
+            Invoke-Recovery -Level 2
         } else {
             Invoke-Recovery -Level $level
         }

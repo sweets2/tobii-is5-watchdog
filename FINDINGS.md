@@ -828,3 +828,14 @@ so it's redundant with this file.
   replacement), records recovery phase/fault type, and excludes monitor gaps from
   hourly rates. The hard constraint remains: no gaze subscription and no automatic
   sleep or reboot.
+- **2026-07-17/18 - descriptor-failure and false-healthy recovery completed.** A
+  live `VID_0000&PID_0002` Code 43 failure was invisible because EyeX reported
+  `unknown`, and the old port matcher incorrectly tried to parse a USB locator from
+  the EyeChip's serial-number instance ID. The watchdog now checks tri-state USB
+  presence every loop, matches the failed node by PnP parent + location, and restarts
+  that live node with `pnputil`. A separate IR-on failure then proved that
+  `Tracking` can coexist with dead gaze: EyeX CPU fell to 0.4% while the EyeChip and
+  services remained OK. Full reconnect, saved-calibration reapply, stale diagnostic
+  client cleanup, and Interaction rebind restored 10.3% engine activity. The full
+  reconnect command now performs that complete transaction and verifies engine load
+  when the user is active, without opening a raw gaze stream.
