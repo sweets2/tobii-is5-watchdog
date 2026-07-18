@@ -74,11 +74,12 @@ Uninstall: `powershell -ExecutionPolicy Bypass -File "C:\Scripts\Uninstall-Tobii
   watchdog stops thrashing and raises a **manual sleep/wake needed** notification.
   On this machine a short owner-initiated S3 cycle restores the electrically absent
   tracker; the watchdog never sleeps or reboots the PC itself.
-- **Catches descriptor failures even when EyeX says `unknown`.** USB presence is
-  checked independently on every loop. A live `VID_0000&PID_0002` Code 43 node is
-  matched to the EyeChip by PnP parent and location, then restarted with
-  `pnputil /restart-device`; the stale serial-number EyeChip node is not mistaken
-  for a USB connection locator.
+- **Catches PnP failures even when EyeX says `unknown`.** USB presence is checked
+  independently on every loop, and a present `Tobii Device` with Code 10 triggers
+  an immediate clean-stack rebuild. A live `VID_0000&PID_0002` Code 43 node is
+  matched to EyeChip by PnP parent and location. USB recovery is bounded to two
+  passes: restart the current representation, rescan, then restart one late Code 43
+  node if the first pass created it. It never loops or touches the shared hub.
 - **Auto-recovers a dead stack** — if the Tobii service or engine process is
   missing (crash, or a cold boot after the battery died in sleep), that's a fault
   too, with a post-boot grace so it never fights the service's delayed autostart.

@@ -845,3 +845,14 @@ so it's redundant with this file.
   scheduled actions now run through `wscript.exe` and `Tobii-RunHidden.vbs` with
   window style 0. The wrapper waits for its PowerShell child, preserving Task
   Scheduler running state, overlap prevention, timeout, and restart behavior.
+- **2026-07-18 - late Code 43 transition and SWD Code 10 blind spot fixed.** The
+  EyeChip remained USB-OK while the present `Tobii Device` software node failed
+  with Problem Code 10 and its HID node disappeared. The CPU detector caught the
+  resulting 0.1% false-`Tracking` stall, but restarting the real EyeChip then
+  created a *new* `VID_0000&PID_0002` descriptor-failed node after the recovery
+  function had already selected its target. The old one-pass function verified
+  failure without restarting that newly reachable node and raised manual sleep.
+  Recovery now detects Code 10 directly and performs a bounded second USB pass when
+  the first pass creates the matching Code 43 node. A terminal flag permits one
+  additional retry only while that exact descriptor node remains present; otherwise
+  it still stops safely and requires owner-initiated power removal.

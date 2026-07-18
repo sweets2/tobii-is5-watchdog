@@ -642,54 +642,96 @@ function Get-TrackerUsbState {
         return 'unknown'
     }
 }
-function Reset-TrackerUsbNode {
-    # SAFE, auto-runnable recovery for a tracker hung mid-enumeration. When the IS5
-    # firmware wedges it can drop its real identity (VID_2104&PID_030C) and appear
-    # as a generic descriptor-failed node (VID_0000&PID_0002). Restart that live
-    # stand-in on the tracker's own port, matched by PnP parent and location; if no
-    # stand-in is live, restart the real tracker node. Never touch the parent hub.
-    $pnputil = Join-Path $env:SystemRoot 'System32\pnputil.exe'
-    $trackerNodes = @(Get-PnpDevice -ErrorAction SilentlyContinue | Where-Object { $_.InstanceId -match 'VID_2104&PID_030C' })
-
-    # EyeChip uses a serial-number instance ID, not a USB connection locator.
-    $trackerParents = @()
-    $trackerLocations = @()
-    foreach ($t in $trackerNodes) {
+function Get-TrackerPortInfo {
+    # Preserve the physical tracker-port identity even when the EyeChip node is
+    # stale/not-present. The serial-number instance suffix is not a port locator.
+    $ports = @()
+    foreach ($t in @(Get-PnpDevice -ErrorAction SilentlyContinue | Where-Object { $_.InstanceId -match 'VID_2104&PID_030C' })) {
         $parent = (Get-PnpDeviceProperty -InstanceId $t.InstanceId -KeyName 'DEVPKEY_Device_Parent' -ErrorAction SilentlyContinue).Data
         $location = (Get-PnpDeviceProperty -InstanceId $t.InstanceId -KeyName 'DEVPKEY_Device_LocationInfo' -ErrorAction SilentlyContinue).Data
-        if ($parent) { $trackerParents += $parent }
-        if ($location) { $trackerLocations += $location }
+        if ($parent -and $location) {
+            $ports += [pscustomobject]@{ Parent = "$parent"; Location = "$location" }
+        }
     }
-
-    $failed = @(Get-PnpDevice -ErrorAction SilentlyContinue | Where-Object {
-        if ($_.InstanceId -notmatch 'VID_0000&PID_0002') { return $false }
-        $present = (Get-PnpDeviceProperty -InstanceId $_.InstanceId -KeyName 'DEVPKEY_Device_IsPresent' -ErrorAction SilentlyContinue).Data
-        if (-not $present) { return $false }
-        $parent = (Get-PnpDeviceProperty -InstanceId $_.InstanceId -KeyName 'DEVPKEY_Device_Parent' -ErrorAction SilentlyContinue).Data
-        $location = (Get-PnpDeviceProperty -InstanceId $_.InstanceId -KeyName 'DEVPKEY_Device_LocationInfo' -ErrorAction SilentlyContinue).Data
-        return ($trackerParents -contains $parent) -and ($trackerLocations -contains $location)
-    })
-
-    # Restarting the live descriptor-failed node clears Code 43. Cycling only a
-    # stale EyeChip node leaves the physical port failure untouched.
+    return @($ports | Sort-Object Parent,Location -Unique)
+}
+function Get-TrackerDescriptorFailedNodes {
+    param([object[]]$TrackerPorts = @(Get-TrackerPortInfo))
+    if (-not $TrackerPorts -or $TrackerPorts.Count -eq 0) { return @() }
+    $resultNodes = @()
+    foreach ($d in @(Get-PnpDevice -ErrorAction SilentlyContinue | Where-Object { $_.InstanceId -match 'VID_0000&PID_0002' })) {
+        $present = (Get-PnpDeviceProperty -InstanceId $d.InstanceId -KeyName 'DEVPKEY_Device_IsPresent' -ErrorAction SilentlyContinue).Data
+        if (-not $present) { continue }
+        $parent = (Get-PnpDeviceProperty -InstanceId $d.InstanceId -KeyName 'DEVPKEY_Device_Parent' -ErrorAction SilentlyContinue).Data
+        $location = (Get-PnpDeviceProperty -InstanceId $d.InstanceId -KeyName 'DEVPKEY_Device_LocationInfo' -ErrorAction SilentlyContinue).Data
+        foreach ($port in $TrackerPorts) {
+            if ($port.Parent -eq "$parent" -and $port.Location -eq "$location") {
+                $resultNodes += $d
+                break
+            }
+        }
+    }
+    return @($resultNodes | Sort-Object InstanceId -Unique)
+}
+function Get-TobiiSoftwareDeviceFault {
+    # A present SWD Tobii Device with Code 10 means the middleware/HID path is dead
+    # even while EyeChip itself remains USB-OK. Treat it as an authoritative stack
+    # fault instead of waiting for two CPU-stall samples.
+    try {
+        foreach ($d in @(Get-PnpDevice -FriendlyName 'Tobii Device' -PresentOnly -ErrorAction Stop)) {
+            $problem = (Get-PnpDeviceProperty -InstanceId $d.InstanceId -KeyName 'DEVPKEY_Device_ProblemCode' -ErrorAction SilentlyContinue).Data
+            if ($d.Status -ne 'OK' -or ($null -ne $problem -and [int]$problem -ne 0)) {
+                return "Tobii Device status=$($d.Status) code=$(if($null -ne $problem){$problem}else{'unknown'})"
+            }
+        }
+    } catch {}
+    return $null
+}
+function Reset-TrackerUsbNode {
+    # Bounded two-pass recovery. Restart whichever tracker representation is live,
+    # rescan, then restart a descriptor-failed stand-in if that first restart
+    # CREATED it. This late transition was observed live on 2026-07-18.
+    $pnputil = Join-Path $env:SystemRoot 'System32\pnputil.exe'
+    $trackerNodes = @(Get-PnpDevice -ErrorAction SilentlyContinue | Where-Object { $_.InstanceId -match 'VID_2104&PID_030C' })
+    $trackerPorts = @(Get-TrackerPortInfo)
+    $failed = @(Get-TrackerDescriptorFailedNodes -TrackerPorts $trackerPorts)
     $nodes = if ($failed.Count -gt 0) { @($failed) } else { @($trackerNodes) }
     if (-not $nodes) { Write-Log 'Tracker USB node not found to port-cycle.' 'WARN'; return $false }
+
+    $restartedIds = @()
     foreach ($d in $nodes) {
         Update-Heartbeat
         Write-Log ("Re-enumerating tracker port node ($($d.Status)): $($d.InstanceId)")
         try { & $pnputil /restart-device "$($d.InstanceId)" 2>&1 | Out-Null } catch {}
+        $restartedIds += $d.InstanceId
         Start-Sleep -Seconds 3
     }
     try { & $pnputil /scan-devices 2>&1 | Out-Null } catch {}
     Start-Sleep -Seconds 4
 
+    # EyeChip can turn into Code 43 only after the first restart. Give that newly
+    # reachable node exactly one restart, then stop; never loop or touch the hub.
+    if ((Get-TrackerUsbState) -ne 'present') {
+        $lateFailed = @(Get-TrackerDescriptorFailedNodes -TrackerPorts $trackerPorts | Where-Object { $restartedIds -notcontains $_.InstanceId })
+        if ($lateFailed.Count -gt 0) {
+            Write-Log 'First USB pass produced a descriptor-failed tracker node; running bounded second pass.' 'WARN'
+            foreach ($d in $lateFailed) {
+                Update-Heartbeat
+                Write-Log ("Restarting late descriptor-failed node: $($d.InstanceId)")
+                try { & $pnputil /restart-device "$($d.InstanceId)" 2>&1 | Out-Null } catch {}
+                Start-Sleep -Seconds 3
+            }
+            try { & $pnputil /scan-devices 2>&1 | Out-Null } catch {}
+            Start-Sleep -Seconds 5
+        }
+    }
+
     $ok = $false
     foreach ($t in @(Get-PnpDevice -ErrorAction SilentlyContinue | Where-Object { $_.InstanceId -match 'VID_2104&PID_030C' })) {
-        $p = (Get-PnpDeviceProperty -InstanceId $t.InstanceId -KeyName 'DEVPKEY_Device_IsPresent' -ErrorAction SilentlyContinue).Data
-        if ($t.Status -eq 'OK' -and $p) { $ok = $true }
-        elseif ($p -and $t.Status -ne 'OK') {
+        $present = (Get-PnpDeviceProperty -InstanceId $t.InstanceId -KeyName 'DEVPKEY_Device_IsPresent' -ErrorAction SilentlyContinue).Data
+        if ($t.Status -eq 'OK' -and $present) { $ok = $true }
+        elseif ($present -and $t.Status -ne 'OK') {
             try { & $pnputil /enable-device "$($t.InstanceId)" 2>&1 | Out-Null } catch {}
-            try { Enable-PnpDevice -InstanceId $t.InstanceId -Confirm:$false -ErrorAction SilentlyContinue } catch {}
             Start-Sleep -Seconds 1
             $now = Get-PnpDevice -InstanceId $t.InstanceId -ErrorAction SilentlyContinue
             $nowPresent = (Get-PnpDeviceProperty -InstanceId $t.InstanceId -KeyName 'DEVPKEY_Device_IsPresent' -ErrorAction SilentlyContinue).Data
@@ -787,13 +829,14 @@ if ($Once) {
     $s = Get-TrackerState
     $down = Get-StackDownReason
     $usbState = Get-TrackerUsbState
+    $softwareFault = Get-TobiiSoftwareDeviceFault
     Write-Log ("Stack=$(if($down){'DOWN: '+$down}else{'up'})  bootGrace=$(Test-InBootGrace)")
-    Write-Log ("USB=$usbState")
+    Write-Log ("USB=$usbState  softwareDevice=$(if($softwareFault){'FAULT: '+$softwareFault}else{'OK'})")
     if (-not $s) { Write-Log "Could not read tracker state." 'WARN'; exit 1 }
     Write-Log ("State=$s  healthy=$([bool]($HealthyStates -contains $s))  trusted=$(-not $down)")
     $cpu = Get-EngineCpuPct -SampleSec 5
     Write-Log ("EngineCPU=$(if($null -ne $cpu){"${cpu}%"}else{'n/a'})  consoleIdle=$(Get-ConsoleIdleSec)s  recalFlag=$([bool](Test-Path -LiteralPath $RecalFlag))")
-    exit $(if ($usbState -in @('absent','faulted')) { 2 } else { 0 })
+    exit $(if (($usbState -in @('absent','faulted')) -or $softwareFault) { 2 } else { 0 })
 }
 if ($ForceReconnect) {
     Write-Log 'Manual -ForceReconnect requested.'
@@ -821,8 +864,11 @@ if ($OnWake) {
     Start-Sleep -Seconds 6
     $s = Get-TrackerState
     $down = Get-StackDownReason
+    $softwareFault = Get-TobiiSoftwareDeviceFault
     if (Test-ConfigActive) {
         Write-Log 'Resume: calibration/config UI active; no action.'
+    } elseif ($softwareFault) {
+        Write-Log ("Resume: $softwareFault; rebuilding the stack.") 'WARN'; Invoke-Recovery -Level 2
     } elseif ($down -and -not (Test-InBootGrace)) {
         Write-Log ("Resume: stack down ($down); reconnecting.") 'WARN'; Invoke-Recovery -Level 2
     } elseif (-not $down -and ($FaultStates -contains $s)) {
@@ -881,6 +927,7 @@ $script:HealthyCpuEwma = 12.0
 $script:LastVerifiedHealthy = $null
 $script:LastStallCpu = $null
 $script:LastHealthSampleCpu = $null
+$script:DescriptorTerminalRetryDone = $false
 $script:RecentFaults = @()
 Clear-Recovering   # never start with a stale recovering flag from a previous run
 Update-Heartbeat
@@ -962,12 +1009,15 @@ while ($true) {
         $s = Get-TrackerState
         $stackDown = Get-StackDownReason
         $usbState = Get-TrackerUsbState
+        $softwareDeviceFault = Get-TobiiSoftwareDeviceFault
 
-        # USB state is authoritative even when the EyeX log is stale or reports
-        # no state. This catches a live Code 43 descriptor failure immediately.
+        # PnP state is authoritative even when the EyeX log is stale or reports
+        # no state. Catch both EyeChip USB failure and live SWD/HID Code 10.
         $fault = $null
         if ($usbState -in @('absent','faulted')) {
             $fault = "EyeChip USB $usbState"
+        } elseif ($softwareDeviceFault) {
+            $fault = $softwareDeviceFault
         } elseif ($stackDown) {
             if (-not (Test-InBootGrace)) { $fault = $stackDown }
         } elseif ($FaultStates -contains $s) {
@@ -986,6 +1036,7 @@ while ($true) {
         if (-not $fault) {
             if ($level -gt 0) { Write-Log "Recovered: state is now '$(if($s){$s}else{'unknown'})'." }
             $level = 0; $unhealthySince = $null
+            $script:DescriptorTerminalRetryDone = $false
             Clear-Recovering
 
             # If the recal flag is up and the calibration file has been rewritten
@@ -1049,13 +1100,21 @@ while ($true) {
             continue
         }
 
-        # A power-cycle-needed state is terminal and bounded. Do not keep creating
-        # recovery levels forever; wait quietly for the owner-initiated sleep/wake.
+        # A power-cycle-needed state is terminal and bounded. If a matching Code 43
+        # node is still reachable, permit exactly one final two-pass software retry;
+        # otherwise wait quietly for owner-initiated sleep/wake.
         if (Test-Path -LiteralPath $RebootNeededFlag) {
             $usbState = Get-TrackerUsbState
             if ($usbState -eq 'present') {
                 Clear-RebootNeeded 'tracker returned after owner power cycle'
+                $script:DescriptorTerminalRetryDone = $false
                 $level = 0; $unhealthySince = Get-Date
+            } elseif (-not $script:DescriptorTerminalRetryDone -and @(Get-TrackerDescriptorFailedNodes).Count -gt 0) {
+                $script:DescriptorTerminalRetryDone = $true
+                Write-Log 'Manual-sleep flag set, but matching descriptor node is reachable; allowing one final bounded USB retry.' 'WARN'
+                Clear-RebootNeeded 'reachable descriptor node gets one final retry'
+                $level = 2
+                $unhealthySince = (Get-Date).AddSeconds(-$StuckThresholdSec)
             } else {
                 $script:RecoveryPhase = 'needs-manual-sleep'
                 Update-Heartbeat
@@ -1112,8 +1171,8 @@ while ($true) {
                   } finally { Exit-RecoveryCoordinator }
                 }
             }
-        # A stack-down fault needs both middleware services restarted.
-        } elseif ($stackDown) {
+        # Code 10 and stack-down faults need both middleware services restarted.
+        } elseif ($softwareDeviceFault -or $stackDown) {
             Invoke-Recovery -Level 2
         } else {
             Invoke-Recovery -Level $level
