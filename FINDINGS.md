@@ -871,3 +871,10 @@ so it's redundant with this file.
   Both normal and cooldown calibration-only success paths now restart Interaction
   before verification, matching the existing guarantee that every recovery level
   repairs the interaction/PTP binding.
+- **2026-07-18 - Mode E is now prevented quietly at lifecycle transitions.**
+  Healthy and dead PTP sessions emit the same Interaction log messages, so there
+  is no trustworthy passive failure signature. The long-running hidden watchdog
+  now queues one Interaction rebind at startup, resume, and session unlock, waits
+  for `Tracking` with no calibration UI or lock screen, then restarts only
+  `Tobii.EyeX.Interaction`. The queued action clears only after that process is
+  present, and it runs inside the existing WScript-hosted task with no console.

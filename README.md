@@ -83,9 +83,9 @@ Uninstall: `powershell -ExecutionPolicy Bypass -File "C:\Scripts\Uninstall-Tobii
 - **Auto-recovers a dead stack** — if the Tobii service or engine process is
   missing (crash, or a cold boot after the battery died in sleep), that's a fault
   too, with a post-boot grace so it never fights the service's delayed autostart.
-- **Prevents the "cursor warp dead" wedge (Mode E):** after every full recovery it
-  waits for the engine to report a *fresh* `Tracking`, then bounces
-  `Tobii.EyeX.Interaction` so its touchpad (PTP) session binds against a live
+- **Prevents the "cursor warp dead" wedge (Mode E):** after every recovery and
+  once after watchdog startup, resume, or unlock, it waits for `Tracking`, then
+  quietly bounces `Tobii.EyeX.Interaction` so its touchpad (PTP) session binds against a live
   engine. If gaze works but warp is dead anyway, the tray's **Fix cursor warp**
   restarts just that process — no full reconnect, no recalibration risk.
 - **Auto-fixes lost calibration after hibernate (Mode D) — no recalibration:**

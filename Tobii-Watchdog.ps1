@@ -945,6 +945,8 @@ $script:LastStallCpu = $null
 $script:LastHealthSampleCpu = $null
 $script:DescriptorTerminalRetryDone = $false
 $script:RecentFaults = @()
+$script:InteractionRebindPending = $true
+$script:InteractionRebindReason = 'watchdog startup'
 Clear-Recovering   # never start with a stale recovering flag from a previous run
 Update-Heartbeat
 # Resume/transition detection: the loop polls every few seconds, so if wall-clock
@@ -986,6 +988,8 @@ while ($true) {
             $lastStallCheck = [DateTime]::MinValue
             $stallStrikes = 0
             $script:JustResumed = $true
+            $script:InteractionRebindPending = $true
+            $script:InteractionRebindReason = 'resume/transition'
         }
 
         # Session-unlock detection: a lock/unlock produces NO clock gap and NO Windows
@@ -1002,6 +1006,8 @@ while ($true) {
             $lastStallCheck = [DateTime]::MinValue
             $stallStrikes = 0
             $script:JustResumed = $true
+            $script:InteractionRebindPending = $true
+            $script:InteractionRebindReason = 'session unlock'
         } elseif ($lockedNow -and -not $script:WasLocked) {
             # PREVENTIVE maintenance on the unlocked->locked edge. The 07-10 hard wedge
             # was armed by an hour of degradation samples and fired when the runtime's
@@ -1054,6 +1060,24 @@ while ($true) {
             $level = 0; $unhealthySince = $null
             $script:DescriptorTerminalRetryDone = $false
             Clear-Recovering
+
+            # A wedged PTP session is indistinguishable from a healthy one in
+            # Tobii's logs. Prevent it at the transitions that create it, but wait
+            # until the engine is live so Interaction binds to fresh Tracking.
+            if ($script:InteractionRebindPending -and $s -eq 'Tracking' -and
+                -not $lockedNow -and -not (Test-ConfigActive)) {
+                if (Enter-RecoveryCoordinator -Reason 'transition-interaction-rebind') {
+                    try {
+                        Write-Log "Quiet interaction rebind after $($script:InteractionRebindReason)."
+                        Restart-InteractionProcess
+                        if (Get-Process -Name 'Tobii.EyeX.Interaction' -ErrorAction SilentlyContinue) {
+                            $script:InteractionRebindPending = $false
+                            $script:InteractionRebindReason = $null
+                        }
+                    } finally { Exit-RecoveryCoordinator }
+                    $lastLoopMark = Get-Date
+                }
+            }
 
             # If the recal flag is up and the calibration file has been rewritten
             # since, the user recalibrated -- clear the flag.
