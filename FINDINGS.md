@@ -864,3 +864,10 @@ so it's redundant with this file.
   full reconnect, which restored EyeChip and 14.4% engine activity. `-OnWake` now
   checks tri-state EyeChip USB status first and immediately runs the complete
   reconnect for `absent`/`faulted`, while preserving the config-UI safety guard.
+- **2026-07-18 - calibration-only recovery now rebinds cursor interaction.** At
+  22:49 a silent stall was cleared by calibration re-apply and engine activity
+  recovered, but `Tobii.EyeX.Interaction` remained the process started at 19:25.
+  The tray therefore stayed green while eye-controlled cursor input was dead.
+  Both normal and cooldown calibration-only success paths now restart Interaction
+  before verification, matching the existing guarantee that every recovery level
+  repairs the interaction/PTP binding.

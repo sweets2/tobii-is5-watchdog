@@ -383,6 +383,9 @@ function Invoke-StallRecovery {
         Write-Log 'Silent stall within restart cooldown; trying calibration re-apply first.' 'WARN'
         Set-RecoveryPhase -Phase 'calibration-reapply' -Reason 'cooldown stall'
         if (Invoke-CalReapply) {
+            # Calibration can restore engine work while the existing interaction
+            # process remains bound to the dead pre-recovery PTP session.
+            Restart-InteractionProcess
             $verify = Test-GazeWorking
             if ($verify -eq 'healthy') {
                 Write-Log 'Stall cleared by calibration re-apply (cooldown path).'
@@ -423,6 +426,9 @@ function Invoke-StallRecovery {
     Set-RecoveryPhase -Phase 'calibration-reapply' -Reason 'silent stall'
     $calOk = Invoke-CalReapply
     if ($calOk) {
+        # Treat calibration-only recovery like every other successful level:
+        # rebind cursor control before declaring the tracker healthy.
+        Restart-InteractionProcess
         $verify = Test-GazeWorking
         if ($verify -eq 'healthy') {
             Write-Log 'Stall cleared by calibration re-apply (no restart needed).'
