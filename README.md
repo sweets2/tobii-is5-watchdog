@@ -33,7 +33,7 @@ Full evidence, quantified logs, and the five distinct failure modes (A–E) are 
 | Component | Role |
 |---|---|
 | `Tobii-Watchdog.ps1` | Passive watchdog. Reads the engine log and process load (never the gaze stream), serializes every recovery request through one coordinator, and runs a bounded recovery state machine. It learns a healthy CPU baseline and catches both near-zero and 4–6% half-alive stalls, including a conservative quiet-user path. |
-| `Tobii-Tray.ps1` / `.vbs` | System-tray app: **Reconnect now**, **Fix cursor warp**, **Recalibrate now**, manual **Sleep/wake tracker**, Pause/Resume, Health report, and Recent disconnects. Green now requires an OK, present EyeChip; blue reports a missing device or active recovery, and gray reports a stale watchdog heartbeat. |
+| `Tobii-Tray.ps1` / `.vbs` | System-tray app: **Reconnect now**, **Fix cursor warp**, **Recalibrate now**, manual **Sleep/wake tracker**, Pause/Resume, Health report, and Recent disconnects. Green requires an OK, present EyeChip, tracker HID, and Tobii software device; blue reports a missing node or active recovery, and gray reports a stale watchdog heartbeat. |
 | `Tobii-Monitor.ps1` | Passive telemetry recorder (observe-only): logs typed incidents/recoveries + snapshots, watchdog recovery phase, and gap-aware statistics. |
 | `Tobii-Sentinel.ps1` | Supervises the watchdog and telemetry heartbeat files and restarts those processes if they hang. It never touches the Tobii stack or machine power. |
 | `Tobii-CalReapply.cs` → `.exe` | The **Mode-D fix**: re-pushes the tracker's *stored* calibration to the live engine after a hibernate-resume — **no restart, no recalibration dots**. Uses the safe engine-IPC path (`Tobii.Interaction`), never a raw gaze stream. Compiled by the installer with the built-in .NET compiler. |
@@ -76,7 +76,8 @@ Uninstall: `powershell -ExecutionPolicy Bypass -File "C:\Scripts\Uninstall-Tobii
   tracker; the watchdog never sleeps or reboots the PC itself.
 - **Catches PnP failures even when EyeX says `unknown`.** USB presence is checked
   independently on every loop, and a present `Tobii Device` with Code 10 triggers
-  an immediate clean-stack rebuild. A live `VID_0000&PID_0002` Code 43 node is
+  an immediate clean-stack rebuild. A missing or faulted live tracker HID does the
+  same even while EyeChip remains USB-OK. A live `VID_0000&PID_0002` Code 43 node is
   matched to EyeChip by PnP parent and location. USB recovery is bounded to two
   passes: restart the current representation, rescan, then restart one late Code 43
   node if the first pass created it. It never loops or touches the shared hub.

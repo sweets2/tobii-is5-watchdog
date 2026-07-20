@@ -878,3 +878,10 @@ so it's redundant with this file.
   for `Tracking` with no calibration UI or lock screen, then restarts only
   `Tobii.EyeX.Interaction`. The queued action clears only after that process is
   present, and it runs inside the existing WScript-hosted task with no console.
+- **2026-07-19 - green EyeChip with missing tracker HID is now an immediate fault.**
+  EyeChip and `Tobii Device` remained present/OK while the live
+  `Tobii Eye Tracker HID` disappeared and EyeX later moved to `WaitingForDevice`.
+  The existing clean-stack rung recovered HID, `Tracking`, and 9.1% engine load,
+  but detection and the tray lagged because both trusted EyeChip alone. The
+  watchdog now treats a missing/faulted tracker HID as authoritative after boot
+  grace, and tray green requires EyeChip, tracker HID, and Tobii Device all OK.

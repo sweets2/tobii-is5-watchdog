@@ -682,15 +682,25 @@ function Get-TrackerDescriptorFailedNodes {
     return @($resultNodes | Sort-Object InstanceId -Unique)
 }
 function Get-TobiiSoftwareDeviceFault {
-    # A present SWD Tobii Device with Code 10 means the middleware/HID path is dead
-    # even while EyeChip itself remains USB-OK. Treat it as an authoritative stack
-    # fault instead of waiting for two CPU-stall samples.
+    # Middleware/HID can disappear while EyeChip itself remains USB-OK. Treat a
+    # faulted Tobii Device or missing/faulted tracker HID as authoritative instead
+    # of waiting for EyeX's delayed state transition or CPU-stall samples.
     try {
         foreach ($d in @(Get-PnpDevice -FriendlyName 'Tobii Device' -PresentOnly -ErrorAction Stop)) {
             $problem = (Get-PnpDeviceProperty -InstanceId $d.InstanceId -KeyName 'DEVPKEY_Device_ProblemCode' -ErrorAction SilentlyContinue).Data
             if ($d.Status -ne 'OK' -or ($null -ne $problem -and [int]$problem -ne 0)) {
                 return "Tobii Device status=$($d.Status) code=$(if($null -ne $problem){$problem}else{'unknown'})"
             }
+        }
+        $trackerHids = @(Get-PnpDevice -FriendlyName 'Tobii Eye Tracker HID' -PresentOnly -ErrorAction Stop)
+        foreach ($d in $trackerHids) {
+            $problem = (Get-PnpDeviceProperty -InstanceId $d.InstanceId -KeyName 'DEVPKEY_Device_ProblemCode' -ErrorAction SilentlyContinue).Data
+            if ($d.Status -ne 'OK' -or ($null -ne $problem -and [int]$problem -ne 0)) {
+                return "Tobii Eye Tracker HID status=$($d.Status) code=$(if($null -ne $problem){$problem}else{'unknown'})"
+            }
+        }
+        if ($trackerHids.Count -eq 0 -and -not (Test-InBootGrace)) {
+            return 'Tobii Eye Tracker HID absent'
         }
     } catch {}
     return $null

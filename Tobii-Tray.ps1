@@ -112,14 +112,21 @@ $sep3 = New-Object System.Windows.Forms.ToolStripSeparator
 [void]$menu.Items.Add($miTelem)
 [void]$menu.Items.Add($miExit)
 
-function Test-EyeChipPresent {
+function Get-TrackerOperationalState {
     try {
-        foreach ($dev in @(Get-PnpDevice -ErrorAction Stop | Where-Object { $_.InstanceId -match 'VID_2104&PID_030C' })) {
-            $present = (Get-PnpDeviceProperty -InstanceId $dev.InstanceId -KeyName 'DEVPKEY_Device_IsPresent' -ErrorAction Stop).Data
-            if ($dev.Status -eq 'OK' -and $present) { return $true }
+        $present = @(Get-PnpDevice -PresentOnly -ErrorAction Stop)
+        if (-not ($present | Where-Object { $_.InstanceId -match 'VID_2104&PID_030C' -and $_.Status -eq 'OK' })) {
+            return 'EyeChip missing'
         }
+        if (-not ($present | Where-Object { $_.FriendlyName -eq 'Tobii Eye Tracker HID' -and $_.Status -eq 'OK' })) {
+            return 'Tracker HID missing'
+        }
+        if (-not ($present | Where-Object { $_.FriendlyName -eq 'Tobii Device' -and $_.Status -eq 'OK' })) {
+            return 'Tobii software device missing'
+        }
+        return 'ready'
     } catch {}
-    return $false
+    return 'PnP status unavailable'
 }
 
 function Apply-State {
@@ -136,7 +143,7 @@ function Apply-State {
     $rebootNeeded = Test-Path $RebootFlag
     $recalNeeded  = Test-Path $RecalFlag
     $recovering   = Test-Path $RecoveringFlag
-    $eyeChipPresent = Test-EyeChipPresent
+    $deviceState = Get-TrackerOperationalState
     $watchdogOnline = $false
     if (Test-Path -LiteralPath $HeartbeatFile) {
         try { $watchdogOnline = (((Get-Date) - (Get-Item -LiteralPath $HeartbeatFile).LastWriteTime).TotalSeconds -lt 120) } catch {}
@@ -149,10 +156,10 @@ function Apply-State {
     elseif ($recalNeeded)           { $ni.Icon = $icoRecal;  $txt = 'RECALIBRATION NEEDED' }
     elseif (-not $watchdogOnline)   { $ni.Icon = $icoOffline; $txt = 'WATCHDOG OFFLINE (supervisor should restart it)' }
     elseif ($recovering -or $phase) { $ni.Icon = $icoRecovering; $txt = "Auto-recovering$(if($phase){': '+$phase}else{''})" }
-    elseif (-not $eyeChipPresent)   { $ni.Icon = $icoRecovering; $txt = 'EyeChip missing - awaiting auto-recovery' }
+    elseif ($deviceState -ne 'ready') { $ni.Icon = $icoRecovering; $txt = "$deviceState - awaiting auto-recovery" }
     elseif ($state.mode -eq 'paused') { $ni.Icon = $icoPaused; $txt = 'Paused (manual)' }
     elseif ($gameActive)            { $ni.Icon = $icoGame;   $txt = 'Auto-paused (game)' }
-    else                            { $ni.Icon = $icoActive; $txt = 'EyeChip online - monitoring' }
+    else                            { $ni.Icon = $icoActive; $txt = 'Tracker stack online - monitoring' }
 
     # One balloon per recovery episode so the user KNOWS the watchdog caught the
     # drop and is working on it (no feedback looks identical to a dead watchdog).
