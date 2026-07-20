@@ -705,6 +705,34 @@ function Get-TobiiSoftwareDeviceFault {
     } catch {}
     return $null
 }
+function Restart-TobiiSoftwareDeviceNode {
+    # Proven Code 10/missing-HID fix: restart the live SWD driver-enumerator
+    # node itself. USB and service restarts can leave this node faulted.
+    Set-RecoveryPhase -Phase 'software-device-restart'
+    $nodes = @(Get-PnpDevice -FriendlyName 'Tobii Device' -PresentOnly -ErrorAction SilentlyContinue)
+    if ($nodes.Count -eq 0) {
+        Write-Log 'No live Tobii Device software node is available to restart.' 'WARN'
+        return $false
+    }
+    $pnputil = "$env:WINDIR\System32\pnputil.exe"
+    foreach ($node in $nodes) {
+        Write-Log "Restarting Tobii software device node: $($node.InstanceId)"
+        try { & $pnputil /restart-device "$($node.InstanceId)" 2>&1 | Out-Null } catch {}
+    }
+    try { & $pnputil /scan-devices 2>&1 | Out-Null } catch {}
+    $remaining = $null
+    for ($i = 0; $i -lt 4; $i++) {
+        Start-Sleep -Seconds 4
+        Update-Heartbeat
+        $remaining = Get-TobiiSoftwareDeviceFault
+        if (-not $remaining) {
+            Write-Log 'Tobii software device and tracker HID are back OK/present.'
+            return $true
+        }
+    }
+    Write-Log "Software-node restart did not clear fault: $remaining" 'WARN'
+    return $false
+}
 function Reset-TrackerUsbNode {
     # Bounded two-pass recovery. Restart whichever tracker representation is live,
     # rescan, then restart a descriptor-failed stand-in if that first restart
@@ -894,7 +922,11 @@ if ($OnWake) {
             Set-RebootNeeded 'wake full reconnect could not restore EyeChip USB presence'
         }
     } elseif ($softwareFault) {
-        Write-Log ("Resume: $softwareFault; rebuilding the stack.") 'WARN'; Invoke-Recovery -Level 2
+        Write-Log ("Resume: $softwareFault; restarting its software node.") 'WARN'
+        if (-not (Restart-TobiiSoftwareDeviceNode)) {
+            Write-Log 'Resume: software-node restart failed; rebuilding the stack.' 'WARN'
+            if (Invoke-CleanStackRestart) { Invoke-CalReapply | Out-Null }
+        }
     } elseif ($down -and -not (Test-InBootGrace)) {
         Write-Log ("Resume: stack down ($down); reconnecting.") 'WARN'; Invoke-Recovery -Level 2
     } elseif (-not $down -and ($FaultStates -contains $s)) {
@@ -1018,23 +1050,11 @@ while ($true) {
             $script:JustResumed = $true
             $script:InteractionRebindPending = $true
             $script:InteractionRebindReason = 'session unlock'
-        } elseif ($lockedNow -and -not $script:WasLocked) {
-            # PREVENTIVE maintenance on the unlocked->locked edge. The 07-10 hard wedge
-            # was armed by an hour of degradation samples and fired when the runtime's
-            # idle->reactivate transition hit the sick device at unlock. A device that
-            # showed degradation gets a full CLEAN reconnect now, while the user is
-            # away (zero disruption): it then sits freshly re-enumerated through the
-            # lock instead of idling in a fragile state. Healthy devices are left
-            # alone -- no churn. Skipped when the tracker is already off the bus
-            # (fault ladder owns that) or a reboot is pending.
-            if (($script:StallDegradationCount -ge 2) -and
-                -not (Test-Path -LiteralPath $RebootNeededFlag) -and
-                -not (Get-StackDownReason) -and
-                -not (Test-TrackerUsbHung)) {
-                Write-Log ("Session lock with $($script:StallDegradationCount) degradation samples since last clean reset; preventive full reconnect while user is away.") 'WARN'
-                if (Invoke-FullReconnect) { Invoke-CalReapply | Out-Null }
-                $lastLoopMark = Get-Date  # long op; do not false-trigger the resume-gap check
-            }
+        } elseif ($lockedNow -and -not $script:WasLocked -and
+                  $script:StallDegradationCount -ge 2) {
+            # Never begin disruptive maintenance at lock: the machine may suspend
+            # seconds later and strand a device-reset transaction across sleep.
+            Write-Log ("Session lock with $($script:StallDegradationCount) degradation samples; deferring recovery to the unlock/wake verification burst.") 'WARN'
         }
         $script:WasLocked = $lockedNow
 
@@ -1175,7 +1195,13 @@ while ($true) {
         }
 
         if ($null -eq $unhealthySince) {
-            $unhealthySince = Get-Date
+            # PnP Code 10/missing HID is authoritative and has a cheap targeted
+            # repair, so do not spend the normal state-log debounce window on it.
+            $unhealthySince = if ($softwareDeviceFault) {
+                (Get-Date).AddSeconds(-$StuckThresholdSec)
+            } else {
+                Get-Date
+            }
             $cutoff = (Get-Date).AddMinutes(-$ClusterWindowMin)
             $script:RecentFaults = @($script:RecentFaults | Where-Object { $_ -gt $cutoff }) + (Get-Date)
             $script:StallDegradationCount += 2
@@ -1198,7 +1224,8 @@ while ($true) {
         $level = [Math]::Min($level + 1, 3)
         Write-Log ("Tracker fault ($fault) -> recovery level $level.") 'WARN'
         Set-Recovering
-        if (($usbState -in @('absent','faulted')) -or ($level -ge 3)) {
+        if (($usbState -in @('absent','faulted')) -or
+            (($level -ge 3) -and -not $softwareDeviceFault)) {
             # WaitingForDevice with the tracker NOT cleanly on the bus (descriptor
             # hang / fell off), or plain restarts have not cleared it. Re-enumerate
             # the tracker's OWN USB port (safe: only its port, verifies it ends
@@ -1221,8 +1248,27 @@ while ($true) {
                   } finally { Exit-RecoveryCoordinator }
                 }
             }
-        # Code 10 and stack-down faults need both middleware services restarted.
-        } elseif ($softwareDeviceFault -or $stackDown) {
+        # Code 10/missing HID is a software-node fault. Restart that exact SWD node
+        # before touching USB; this restored the live tracker immediately in the
+        # 2026-07-20 incident where service and USB restarts had both failed.
+        } elseif ($softwareDeviceFault) {
+            if (Enter-RecoveryCoordinator -Reason 'software-device-recovery') {
+                try {
+                    $softwareOk = Restart-TobiiSoftwareDeviceNode
+                    if (-not $softwareOk) {
+                        Write-Log 'Targeted software-node restart failed; rebuilding the clean stack.' 'WARN'
+                        Invoke-CleanStackRestart | Out-Null
+                        $softwareOk = -not [bool](Get-TobiiSoftwareDeviceFault)
+                    }
+                    if ($softwareOk) {
+                        Clear-RebootNeeded 'software device and tracker HID restored'
+                        Clear-Recovering
+                    } elseif ($level -ge 3) {
+                        Set-RebootNeeded 'software device remained faulted after targeted restart and clean-stack rebuild; manual sleep/wake required'
+                    }
+                } finally { Exit-RecoveryCoordinator }
+            }
+        } elseif ($stackDown) {
             Invoke-Recovery -Level 2
         } else {
             Invoke-Recovery -Level $level

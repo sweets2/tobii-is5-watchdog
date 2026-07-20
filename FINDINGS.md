@@ -885,3 +885,12 @@ so it's redundant with this file.
   but detection and the tray lagged because both trusted EyeChip alone. The
   watchdog now treats a missing/faulted tracker HID as authoritative after boot
   grace, and tray green requires EyeChip, tracker HID, and Tobii Device all OK.
+- **2026-07-20 - restart the faulted SWD node directly; never reconnect at lock.**
+  A degradation-triggered preventive reconnect began at session lock, then sleep
+  suspended it for hours mid-transaction. On resume, the stale transaction
+  overlapped wake handling and left live `Tobii Device` at Code 10 with tracker HID
+  absent. Repeated service rebuilds and EyeChip USB re-enumerations did not clear
+  it; `pnputil /restart-device` on the exact live SWD `Tobii Device` immediately
+  cleared Code 10, restored HID, `Tracking`, and 16.9% engine activity. That exact,
+  verified restart is now the first bounded software-fault rung. Lock-time full
+  reconnect is removed; unlock/wake verification owns deferred recovery.

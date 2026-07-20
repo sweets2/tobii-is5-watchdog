@@ -121,7 +121,7 @@ non-elevated and `-ErrorAction SilentlyContinue` hides the access-denied.
 - Passive fault detection: state log + stack presence + engine-CPU stall sampling (20s confirm, 5s poll)
 - Escalating ladder: runtime restart -> full stack -> port re-enumeration -> sleep/wake-needed flag; fail-fast escalation (no more 90s waits on a parked WaitingForDevice); warp re-bind after every level
 - Wake/unlock coverage: clock-gap resume detection + LogonUI-based unlock detection, both enter a 150s burst window (15s checks, act on first strike)
-- Preventive: at session LOCK with accumulated degradation samples -> full clean reconnect while the user is away (the unlock then starts from a fresh device)
+- Lock safety: never start device maintenance at session lock, because suspend can strand a reset transaction; defer to the unlock/wake verification burst
 - Visibility: tray icon green/orange/yellow/red (active/recovering/paused/failure) + one balloon per recovery episode; left-click = menu (no more silent pause toggling)
 - Latency floor: the engine takes ~90s to boot to Tracking; level-1 outage ~1.5-2 min, level-2 ~3 min. No watchdog change can beat the engine boot time.
 - KNOWN BLIND SPOT: the stall detector requires recent user input; for a gaze-mouse user a dead tracker CAUSES input idle, suppressing its own detection (catch-22, found 07-10 18:09). Fix planned: allow idle-time stall recovery with more strikes.

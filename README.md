@@ -75,9 +75,9 @@ Uninstall: `powershell -ExecutionPolicy Bypass -File "C:\Scripts\Uninstall-Tobii
   On this machine a short owner-initiated S3 cycle restores the electrically absent
   tracker; the watchdog never sleeps or reboots the PC itself.
 - **Catches PnP failures even when EyeX says `unknown`.** USB presence is checked
-  independently on every loop, and a present `Tobii Device` with Code 10 triggers
-  an immediate clean-stack rebuild. A missing or faulted live tracker HID does the
-  same even while EyeChip remains USB-OK. A live `VID_0000&PID_0002` Code 43 node is
+  independently on every loop. A present `Tobii Device` with Code 10 or a missing
+  tracker HID triggers an immediate restart of that exact software node, escalating
+  to a clean-stack rebuild only if needed. A live `VID_0000&PID_0002` Code 43 node is
   matched to EyeChip by PnP parent and location. USB recovery is bounded to two
   passes: restart the current representation, rescan, then restart one late Code 43
   node if the first pass created it. It never loops or touches the shared hub.
@@ -108,7 +108,9 @@ Uninstall: `powershell -ExecutionPolicy Bypass -File "C:\Scripts\Uninstall-Tobii
   There's a manual **"Re-apply saved calibration"** tray item too.
 - **Safe by design:** it never subscribes to gaze, never intervenes during
   calibration, and never sleeps or reboots the PC automatically. Wake, tray, and
-  main-loop recoveries share a global coordinator so they cannot collide.
+  main-loop recoveries share a global coordinator so they cannot collide. Session
+  lock never starts device maintenance because the PC may suspend mid-transaction;
+  the unlock/wake verification burst owns recovery instead.
 - **What it can't auto-fix:** a *first-time* or genuinely corrupt calibration —
   if no valid calibration was ever stored, there's nothing to re-apply and you
   must do the dots once (it detects and notifies). And the rare "streaming but
