@@ -65,6 +65,7 @@ param(
     [int]$QuietStallStrikes    = 3,
     [int]$InteractionDegradationStrikes = 3,
     [int]$InteractionRebindCooldownMin = 15,
+    [int]$InteractionBindingLeaseMin = 20,
     [int]$ClusterWindowMin     = 30,
     [int]$ClusterEscalateCount = 3,
     [int]$StallCooldownMin     = 45,
@@ -574,15 +575,15 @@ function Restart-InteractionProcess {
     # up with a dead PTP (touchpad-filter) session -- gaze works everywhere, but
     # warp does nothing while the process still logs 'Flush sent', so there is NO
     # log signature to auto-detect. Restarting it against an engine that is
-    # already Tracking re-binds the session. Tobii.Service does not respawn a
-    # killed interaction process, hence the manual-start fallback.
+    # already Tracking re-binds the session. Tobii.Service usually does not
+    # respawn a killed interaction process, hence the short manual-start fallback.
     $exe = 'C:\Program Files (x86)\Tobii\Tobii EyeX Interaction\Tobii.EyeX.Interaction.exe'
     $p = Get-Process -Name 'Tobii.EyeX.Interaction' -ErrorAction SilentlyContinue
     if ($p) {
         Write-Log ("Restarting Tobii.EyeX.Interaction (pid " + (($p | ForEach-Object { $_.Id }) -join ',') + ") to reset the PTP session.")
         $p | Stop-Process -Force -ErrorAction SilentlyContinue
     }
-    for ($i = 0; $i -lt 10; $i++) {
+    for ($i = 0; $i -lt 3; $i++) {
         Start-Sleep -Seconds 1
         if (Get-Process -Name 'Tobii.EyeX.Interaction' -ErrorAction SilentlyContinue) {
             Write-Log 'Tobii.EyeX.Interaction respawned on its own.'
@@ -591,7 +592,7 @@ function Restart-InteractionProcess {
         }
     }
     if (Test-Path -LiteralPath $exe) {
-        Write-Log 'No auto-respawn after 10s; starting Tobii.EyeX.Interaction directly.'
+        Write-Log 'No auto-respawn after 3s; starting Tobii.EyeX.Interaction directly.'
         Start-Process -FilePath $exe
         $script:LastInteractionRebind = Get-Date
     } else {
@@ -979,7 +980,7 @@ if (-not $createdNew) { Write-Log 'Another watchdog instance is already running;
 
 # ---- main loop -------------------------------------------------------------
 Rotate-Log
-Write-Log "Tobii watchdog (log-state + stack-presence + silent-stall) started. threshold=${StuckThresholdSec}s poll=${PollSec}s grace=${GraceSec}s bootgrace=${BootGraceSec}s stall<${StallCpuPct}%cpu/${StallCheckEverySec}s cooldown=${StallCooldownMin}m burst=${BurstStallCheckSec}s/${BurstSec}s resumegap=${ResumeGapSec}s log=$LogPath"
+Write-Log "Tobii watchdog (log-state + stack-presence + silent-stall) started. threshold=${StuckThresholdSec}s poll=${PollSec}s grace=${GraceSec}s bootgrace=${BootGraceSec}s stall<${StallCpuPct}%cpu/${StallCheckEverySec}s cooldown=${StallCooldownMin}m ptplease=${InteractionBindingLeaseMin}m burst=${BurstStallCheckSec}s/${BurstSec}s resumegap=${ResumeGapSec}s log=$LogPath"
 $level = 0; $unhealthySince = $null; $iter = 0; $paused = $false
 $stallStrikes = 0; $lastStallCheck = Get-Date; $script:LastStallRecovery = $null
 $script:CooldownReconnectDone = $false; $script:JustResumed = $false
@@ -1114,6 +1115,30 @@ while ($true) {
                 }
             }
 
+            # Mode E's dead and healthy PTP sessions are externally identical: PnP,
+            # EyeX state, engine CPU, and Interaction's own logs can all remain healthy.
+            # Renew the binding as a bounded lease while the user is active. The
+            # interaction-only bounce is the confirmed fix and cannot disturb USB,
+            # services, calibration, or unrelated applications. This closes the blind
+            # spot observed on 2026-07-20, when warp died 26 minutes after a good bind
+            # while the engine was still doing 16% CPU.
+            if ($s -eq 'Tracking' -and -not $script:InteractionRebindPending -and
+                $script:LastInteractionRebind -and
+                ((Get-Date) - $script:LastInteractionRebind).TotalMinutes -ge $InteractionBindingLeaseMin -and
+                (Get-ConsoleIdleSec) -le $StallIdleMaxSec -and
+                -not $lockedNow -and -not (Test-ConfigActive)) {
+                if (Enter-RecoveryCoordinator -Reason 'interaction-binding-lease') {
+                    try {
+                        $leaseAge = [Math]::Round(((Get-Date) - $script:LastInteractionRebind).TotalMinutes, 1)
+                        Write-Log "Interaction binding lease expired after ${leaseAge}m of active Tracking; quietly renewing the PTP session." 'WARN'
+                        Restart-InteractionProcess
+                        $script:StallDegradationCount = 0
+                        $stallStrikes = 0
+                    } finally { Exit-RecoveryCoordinator }
+                    $lastStallCheck = Get-Date
+                    $lastLoopMark = Get-Date
+                }
+            }
             # If the recal flag is up and the calibration file has been rewritten
             # since, the user recalibrated -- clear the flag.
             if (Test-Path -LiteralPath $RecalFlag) {

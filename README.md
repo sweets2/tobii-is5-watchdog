@@ -91,6 +91,10 @@ Uninstall: `powershell -ExecutionPolicy Bypass -File "C:\Scripts\Uninstall-Tobii
   restarts just that process — no full reconnect, no recalibration risk. Because
   healthy and dead PTP sessions log identically, three accumulated degraded engine
   samples also trigger this lightweight repair, rate-limited to once per 15 minutes.
+  A second bounded safeguard renews the Interaction/PTP binding after 20 minutes of
+  active `Tracking` while the session is unlocked. This covers the confirmed case
+  where the cursor warp died with every device healthy and the engine still busy;
+  the renewal restarts only Interaction and normally completes in about 3 seconds.
 - **Auto-fixes lost calibration after hibernate (Mode D) — no recalibration:**
   the engine can claim `Tracking` while doing no gaze work at all (seen live: 22
   minutes at ~0.3% CPU; healthy tracking runs ~8–13%; the IR LEDs go dark). This

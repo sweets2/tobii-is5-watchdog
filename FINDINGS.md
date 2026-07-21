@@ -902,3 +902,13 @@ so it's redundant with this file.
   three accumulated degraded CPU samples as a safe precursor: it quietly rebinds
   Interaction once, rate-limited to 15 minutes, before escalating to calibration,
   stack, or USB recovery. Consecutive confirmed stalls still take precedence.
+- **2026-07-20 - active-session PTP binding lease closes the healthy-engine blind spot.**
+  Cursor control failed again about 26 minutes after an unlock-time Interaction
+  rebind while every present PnP node was OK, EyeX still reported `Tracking`, and
+  engine activity measured 16% of one core. Restarting only
+  `Tobii.EyeX.Interaction` (PID 1556 -> 19324) immediately restored control, proving
+  that CPU degradation is not a necessary Mode-E precursor. Because Tobii exposes
+  no passive success/failure signal for this binding, the watchdog now gives it a
+  bounded 20-minute lease during active, unlocked `Tracking` outside calibration,
+  then renews only Interaction. The non-respawn fallback is shortened from 10 to 3
+  seconds, matching observed behavior and reducing the maintenance interruption.
