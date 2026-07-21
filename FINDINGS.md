@@ -912,3 +912,12 @@ so it's redundant with this file.
   bounded 20-minute lease during active, unlocked `Tracking` outside calibration,
   then renews only Interaction. The non-respawn fallback is shortened from 10 to 3
   seconds, matching observed behavior and reducing the maintenance interruption.
+- **2026-07-21 - silent-stall detection now samples every second.** The prior
+  minute-based blocking samples detected a false-`Tracking` stall at 15:47 but an
+  idle/unverified recovery and later ladder retries delayed verified recovery until
+  16:09. The watchdog now takes nonblocking cumulative-CPU snapshots every second
+  and decides from a rolling 12-second window, producing an active-session decision
+  in about 13-15 seconds. Heavy PnP enumeration remains throttled to five seconds
+  and heartbeat writes to five seconds. A steady 60-second measurement on the
+  12-thread target was 0.347% whole-machine CPU and 112.1 MB working set (stable),
+  compared with 0.059% and 58.9 MB for the previous minute-based implementation.

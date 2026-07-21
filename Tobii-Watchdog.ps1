@@ -51,7 +51,7 @@
 [CmdletBinding()]
 param(
     [int]$StuckThresholdSec = 20,
-    [int]$PollSec          = 5,
+    [int]$PollSec          = 1,
     [int]$GraceSec         = 25,
     [int]$BootGraceSec     = 240,
     [string]$LogPath       = 'C:\Scripts\Tobii-Watchdog.log',
@@ -61,7 +61,9 @@ param(
     [double]$StallCpuPct       = 6.0,
     [double]$HardStallCpuPct   = 1.5,
     [int]$StallIdleMaxSec      = 60,
-    [int]$StallCheckEverySec   = 60,
+    [int]$StallCheckEverySec   = 1,
+    [int]$StallSampleWindowSec = 12,
+    [int]$PnpCheckEverySec     = 5,
     [int]$QuietStallStrikes    = 3,
     [int]$InteractionDegradationStrikes = 3,
     [int]$InteractionRebindCooldownMin = 15,
@@ -71,7 +73,7 @@ param(
     [int]$StallCooldownMin     = 45,
     [int]$ResumeGapSec         = 90,
     [int]$BurstSec             = 150,
-    [int]$BurstStallCheckSec   = 15,
+    [int]$BurstStallCheckSec   = 1,
     [string]$RecalFlag         = 'C:\Scripts\tobii-recal-needed.flag',
     [string]$RebootNeededFlag  = 'C:\Scripts\tobii-reboot-needed.flag',
     [string]$RecoveringFlag    = 'C:\Scripts\tobii-recovering.flag',
@@ -229,6 +231,33 @@ function Get-EngineCpuPct {
     if (-not $p2 -or $p2.ProcessName -ne 'Tobii.EyeX.Engine') { return $null }
     return [Math]::Round((($p2.CPU - $cpu1) / $SampleSec) * 100, 1)
 }
+function Reset-EngineCpuSampler {
+    $script:EngineCpuSamples = New-Object 'System.Collections.Generic.List[object]'
+    $script:EngineCpuSamplePid = $null
+}
+function Get-RollingEngineCpuPct {
+    # Cheap, nonblocking sampler called once per loop. Cumulative process CPU is
+    # differenced across a rolling window, so every-second observations do not
+    # become noisy one-second recovery decisions.
+    $p = Get-Process -Name 'Tobii.EyeX.Engine' -ErrorAction SilentlyContinue | Select-Object -First 1
+    if (-not $p) { Reset-EngineCpuSampler; return $null }
+    if ($script:EngineCpuSamplePid -ne $p.Id) {
+        Reset-EngineCpuSampler
+        $script:EngineCpuSamplePid = $p.Id
+    }
+    $now = Get-Date
+    $script:EngineCpuSamples.Add([pscustomobject]@{ Time=$now; Cpu=[double]$p.CPU })
+    while ($script:EngineCpuSamples.Count -gt 2 -and
+           ($now - $script:EngineCpuSamples[1].Time).TotalSeconds -ge $StallSampleWindowSec) {
+        $script:EngineCpuSamples.RemoveAt(0)
+    }
+    $first = $script:EngineCpuSamples[0]
+    $span = ($now - $first.Time).TotalSeconds
+    if ($span -lt $StallSampleWindowSec) { return $null }
+    $delta = [double]$p.CPU - [double]$first.Cpu
+    if ($delta -lt 0) { Reset-EngineCpuSampler; return $null }
+    return [Math]::Round(($delta / $span) * 100, 1)
+}
 function Get-DegradedCpuThreshold {
     # Learn this machine's healthy engine load, but keep the decision boundary in
     # a conservative range. The observed frozen 4.1% state must not pass as healthy.
@@ -239,22 +268,22 @@ function Test-SilentStall {
     # Returns 'active' or 'quiet' for a degraded sample, otherwise $null. The
     # quiet path closes the gaze-user catch-22: dead gaze causes input-idle, so
     # conventional input cannot be a mandatory detector gate.
-    if (Get-StackDownReason) { return $false }
-    if ((Get-TrackerState) -ne 'Tracking') { return $false }
-    if ([bool](Get-Process -Name 'LogonUI' -ErrorAction SilentlyContinue)) { return $false }
+    if (Get-StackDownReason) { Reset-EngineCpuSampler; return $false }
+    if ((Get-TrackerState) -ne 'Tracking') { Reset-EngineCpuSampler; return $false }
+    if ([bool](Get-Process -Name 'LogonUI' -ErrorAction SilentlyContinue)) { Reset-EngineCpuSampler; return $false }
     $active = ((Get-ConsoleIdleSec) -le $StallIdleMaxSec)
     if (-not $active -and (-not $script:LastVerifiedHealthy -or
         ((Get-Date) - $script:LastVerifiedHealthy).TotalMinutes -gt 10)) {
         return $null
     }
-    $cpu = Get-EngineCpuPct -SampleSec 12
+    $cpu = Get-RollingEngineCpuPct
     if ($null -eq $cpu) { return $null }
     $script:LastHealthSampleCpu = $cpu
     $threshold = Get-DegradedCpuThreshold
     if ($cpu -ge $threshold) {
         if ($active -and $cpu -ge 8) {
             $baseline = if ($script:HealthyCpuEwma) { $script:HealthyCpuEwma } else { 12.0 }
-            $script:HealthyCpuEwma = [Math]::Round((0.8 * $baseline) + (0.2 * $cpu), 1)
+            $script:HealthyCpuEwma = [Math]::Round((0.95 * $baseline) + (0.05 * $cpu), 1)
             $script:LastVerifiedHealthy = Get-Date
         }
         return $null
@@ -571,6 +600,7 @@ function Restart-EyeXEngine {
     }
 }
 function Restart-InteractionProcess {
+    Reset-EngineCpuSampler
     # Mode E fix ("gaze fine, cursor warp dead"): Tobii.EyeX.Interaction can come
     # up with a dead PTP (touchpad-filter) session -- gaze works everywhere, but
     # warp does nothing while the process still logs 'Flush sent', so there is NO
@@ -980,7 +1010,7 @@ if (-not $createdNew) { Write-Log 'Another watchdog instance is already running;
 
 # ---- main loop -------------------------------------------------------------
 Rotate-Log
-Write-Log "Tobii watchdog (log-state + stack-presence + silent-stall) started. threshold=${StuckThresholdSec}s poll=${PollSec}s grace=${GraceSec}s bootgrace=${BootGraceSec}s stall<${StallCpuPct}%cpu/${StallCheckEverySec}s cooldown=${StallCooldownMin}m ptplease=${InteractionBindingLeaseMin}m burst=${BurstStallCheckSec}s/${BurstSec}s resumegap=${ResumeGapSec}s log=$LogPath"
+Write-Log "Tobii watchdog (log-state + stack-presence + silent-stall) started. threshold=${StuckThresholdSec}s poll=${PollSec}s rollingcpu=${StallSampleWindowSec}s pnp=${PnpCheckEverySec}s grace=${GraceSec}s bootgrace=${BootGraceSec}s stall<${StallCpuPct}%cpu cooldown=${StallCooldownMin}m ptplease=${InteractionBindingLeaseMin}m burst=${BurstStallCheckSec}s/${BurstSec}s resumegap=${ResumeGapSec}s log=$LogPath"
 $level = 0; $unhealthySince = $null; $iter = 0; $paused = $false
 $stallStrikes = 0; $lastStallCheck = Get-Date; $script:LastStallRecovery = $null
 $script:CooldownReconnectDone = $false; $script:JustResumed = $false
@@ -990,6 +1020,8 @@ $script:HealthyCpuEwma = 12.0
 $script:LastVerifiedHealthy = $null
 $script:LastStallCpu = $null
 $script:LastHealthSampleCpu = $null
+$script:EngineCpuSamples = New-Object 'System.Collections.Generic.List[object]'
+$script:EngineCpuSamplePid = $null
 $script:DescriptorTerminalRetryDone = $false
 $script:RecentFaults = @()
 $script:InteractionRebindPending = $true
@@ -1004,10 +1036,17 @@ Update-Heartbeat
 # recheck window so a post-wake Mode-D stall is caught in ~15s, not up to a minute.
 $lastLoopMark = Get-Date
 $burstUntil   = (Get-Date).AddSeconds($BurstSec)
+$lastHeartbeat = [DateTime]::MinValue
+$lastPnpCheck = [DateTime]::MinValue
+$usbState = 'unknown'
+$softwareDeviceFault = $null
 while ($true) {
     try {
-        Update-Heartbeat
-        if ((++$iter % 60) -eq 0) { Rotate-Log }
+        if (((Get-Date) - $lastHeartbeat).TotalSeconds -ge 5) {
+            Update-Heartbeat
+            $lastHeartbeat = Get-Date
+        }
+        if ((++$iter % 300) -eq 0) { Rotate-Log }
 
         if ((Test-Path -LiteralPath $RecoveryRequestFile) -and -not (Test-ConfigActive)) {
             try { Remove-Item -LiteralPath $RecoveryRequestFile -Force -ErrorAction SilentlyContinue } catch {}
@@ -1038,6 +1077,7 @@ while ($true) {
             $script:JustResumed = $true
             $script:InteractionRebindPending = $true
             $script:InteractionRebindReason = 'resume/transition'
+            Reset-EngineCpuSampler
         }
 
         # Session-unlock detection: a lock/unlock produces NO clock gap and NO Windows
@@ -1056,6 +1096,7 @@ while ($true) {
             $script:JustResumed = $true
             $script:InteractionRebindPending = $true
             $script:InteractionRebindReason = 'session unlock'
+            Reset-EngineCpuSampler
         } elseif ($lockedNow -and -not $script:WasLocked -and
                   $script:StallDegradationCount -ge 2) {
             # Never begin disruptive maintenance at lock: the machine may suspend
@@ -1065,9 +1106,15 @@ while ($true) {
         $script:WasLocked = $lockedNow
 
         $s = Get-TrackerState
+        if ($s -ne 'Tracking') { Reset-EngineCpuSampler }
         $stackDown = Get-StackDownReason
-        $usbState = Get-TrackerUsbState
-        $softwareDeviceFault = Get-TobiiSoftwareDeviceFault
+        # Device enumeration is authoritative but comparatively expensive. Keep it
+        # on a five-second cadence while log/process/CPU detection runs each second.
+        if (((Get-Date) - $lastPnpCheck).TotalSeconds -ge $PnpCheckEverySec) {
+            $usbState = Get-TrackerUsbState
+            $softwareDeviceFault = Get-TobiiSoftwareDeviceFault
+            $lastPnpCheck = Get-Date
+        }
 
         # PnP state is authoritative even when the EyeX log is stale or reports
         # no state. Catch both EyeChip USB failure and live SWD/HID Code 10.
@@ -1150,12 +1197,13 @@ while ($true) {
                 }
             }
 
-            # Periodic silent-stall check (Mode B/D): 'Tracking' can be a lie.
-            # Steady state: two positive samples ~a minute apart before acting.
-            # In the post-transition burst window: check every ${BurstStallCheckSec}s
-            # and act on the FIRST confirmed stall, so a post-wake dead tracker heals
-            # in ~15s instead of up to two minutes. Never while the calibration UI is open.
+            # Continuous silent-stall check (Mode B/D): 'Tracking' can be a lie.
+            # Sample cumulative engine CPU every second without blocking and decide
+            # from a rolling ${StallSampleWindowSec}s window. Two active (or three
+            # quiet) overlapping confirmations act in about 13-15s, not minutes.
+            # Never sample while the calibration UI is open.
             $inBurst      = (Get-Date) -lt $burstUntil
+            if (Test-ConfigActive) { Reset-EngineCpuSampler }
             $checkEvery   = if ($inBurst) { $BurstStallCheckSec } else { $StallCheckEverySec }
             if ($s -eq 'Tracking' -and -not (Test-ConfigActive) -and
                 ((Get-Date) - $lastStallCheck).TotalSeconds -ge $checkEvery) {

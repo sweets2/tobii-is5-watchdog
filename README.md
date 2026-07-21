@@ -100,9 +100,14 @@ Uninstall: `powershell -ExecutionPolicy Bypass -File "C:\Scripts\Uninstall-Tobii
   minutes at ~0.3% CPU; healthy tracking runs ~8–13%; the IR LEDs go dark). This
   is the classic hibernate-resume failure: the tracker's calibration is volatile
   firmware state, wiped when hibernate cuts its power, and no restart re-binds it.
-  The watchdog compares engine CPU with a learned healthy baseline. It has a fast
-  user-active path plus a slower quiet-session path, because dead gaze can itself
-  stop conventional input. On a confirmed stall it **re-applies
+  The watchdog compares engine CPU with a learned healthy baseline. It takes a
+  lightweight nonblocking CPU snapshot every second and decides from a rolling
+  12-second window, normally confirming an active-session stall in 13-15 seconds.
+  PnP enumeration stays on a separate five-second cadence. The quiet-session path
+  remains conservative because dead gaze can itself stop conventional input.
+  A 60-second measurement on the target 12-thread m15 R2 showed 0.347% whole-machine
+  CPU and 112.1 MB working set, versus 0.059% and 58.9 MB for the old minute-based
+  detector; memory stayed flat during the sample. On a confirmed stall it **re-applies
   your *stored* calibration to the engine** (`Tobii-CalReapply.exe`) — the same
   thing the calibration UI does, minus the dots — in about a second, with no
   restart. This runs first (it's cheap and non-disruptive); only if it *and* the
