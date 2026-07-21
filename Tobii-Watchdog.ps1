@@ -63,6 +63,8 @@ param(
     [int]$StallIdleMaxSec      = 60,
     [int]$StallCheckEverySec   = 60,
     [int]$QuietStallStrikes    = 3,
+    [int]$InteractionDegradationStrikes = 3,
+    [int]$InteractionRebindCooldownMin = 15,
     [int]$ClusterWindowMin     = 30,
     [int]$ClusterEscalateCount = 3,
     [int]$StallCooldownMin     = 45,
@@ -584,12 +586,14 @@ function Restart-InteractionProcess {
         Start-Sleep -Seconds 1
         if (Get-Process -Name 'Tobii.EyeX.Interaction' -ErrorAction SilentlyContinue) {
             Write-Log 'Tobii.EyeX.Interaction respawned on its own.'
+            $script:LastInteractionRebind = Get-Date
             return
         }
     }
     if (Test-Path -LiteralPath $exe) {
         Write-Log 'No auto-respawn after 10s; starting Tobii.EyeX.Interaction directly.'
         Start-Process -FilePath $exe
+        $script:LastInteractionRebind = Get-Date
     } else {
         Write-Log "Interaction exe not found at '$exe'; cannot restart it." 'WARN'
     }
@@ -989,6 +993,7 @@ $script:DescriptorTerminalRetryDone = $false
 $script:RecentFaults = @()
 $script:InteractionRebindPending = $true
 $script:InteractionRebindReason = 'watchdog startup'
+$script:LastInteractionRebind = $null
 Clear-Recovering   # never start with a stale recovering flag from a previous run
 Update-Heartbeat
 # Resume/transition detection: the loop polls every few seconds, so if wall-clock
@@ -1147,6 +1152,23 @@ while ($true) {
                         }
                         $lastStallCheck = Get-Date
                         $lastLoopMark = Get-Date
+                    } elseif ($script:StallDegradationCount -ge $InteractionDegradationStrikes -and
+                              (-not $script:LastInteractionRebind -or
+                               ((Get-Date) - $script:LastInteractionRebind).TotalMinutes -ge $InteractionRebindCooldownMin) -and
+                              -not $lockedNow) {
+                        # Mode E has no direct log signature. Repeated nonconsecutive
+                        # degraded samples are its only safe passive precursor, so
+                        # try the interaction-only repair before heavier recovery.
+                        if (Enter-RecoveryCoordinator -Reason 'degraded-interaction-rebind') {
+                            try {
+                                Write-Log ("$($script:StallDegradationCount) accumulated degraded samples; quietly rebinding Interaction before heavier recovery.") 'WARN'
+                                Restart-InteractionProcess
+                                $script:StallDegradationCount = 0
+                                $stallStrikes = 0
+                            } finally { Exit-RecoveryCoordinator }
+                            $lastStallCheck = Get-Date
+                            $lastLoopMark = Get-Date
+                        }
                     }
                 } else {
                     $stallStrikes = 0

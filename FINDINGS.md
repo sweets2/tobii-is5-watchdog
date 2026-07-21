@@ -894,3 +894,11 @@ so it's redundant with this file.
   cleared Code 10, restored HID, `Tracking`, and 16.9% engine activity. That exact,
   verified restart is now the first bounded software-fault rung. Lock-time full
   reconnect is removed; unlock/wake verification owns deferred recovery.
+- **2026-07-20 - accumulated degradation now triggers a bounded Mode-E rebind.**
+  In a PnP-healthy failure, the engine hovered just above the dynamic threshold at
+  6.2% and Interaction continued logging normal presence events, but control was
+  dead. Restarting only `Tobii.EyeX.Interaction` restored 23.4% engine activity.
+  Since dead and healthy PTP sessions have identical logs, the watchdog now uses
+  three accumulated degraded CPU samples as a safe precursor: it quietly rebinds
+  Interaction once, rate-limited to 15 minutes, before escalating to calibration,
+  stack, or USB recovery. Consecutive confirmed stalls still take precedence.

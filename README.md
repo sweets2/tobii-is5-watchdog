@@ -88,7 +88,9 @@ Uninstall: `powershell -ExecutionPolicy Bypass -File "C:\Scripts\Uninstall-Tobii
   once after watchdog startup, resume, or unlock, it waits for `Tracking`, then
   quietly bounces `Tobii.EyeX.Interaction` so its touchpad (PTP) session binds against a live
   engine. If gaze works but warp is dead anyway, the tray's **Fix cursor warp**
-  restarts just that process — no full reconnect, no recalibration risk.
+  restarts just that process — no full reconnect, no recalibration risk. Because
+  healthy and dead PTP sessions log identically, three accumulated degraded engine
+  samples also trigger this lightweight repair, rate-limited to once per 15 minutes.
 - **Auto-fixes lost calibration after hibernate (Mode D) — no recalibration:**
   the engine can claim `Tracking` while doing no gaze work at all (seen live: 22
   minutes at ~0.3% CPU; healthy tracking runs ~8–13%; the IR LEDs go dark). This
